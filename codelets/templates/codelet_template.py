@@ -343,7 +343,6 @@ class CodeletTemplate(object):
 
     def instantiate(self, instance_args):
         assert all([not do.flex_param.is_set() for do in self.dummy_ops.values()])
-
         inputs = [i.instantiate(instance_args) for i in self.inputs]
         outputs = [o.instantiate(instance_args) for o in self.outputs]
         temps = [t.instantiate(instance_args) for t in self.temps]

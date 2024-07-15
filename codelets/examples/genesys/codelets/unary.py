@@ -223,24 +223,24 @@ def elem_exp(hag):
     with CodeletTemplate("elem_exp") as cdlt:
         N = cdlt.dummy_op("N", cdlt.node.inputs[0].shape[0])
         C = cdlt.dummy_op("C", cdlt.node.inputs[0].shape[1])
-        H = cdlt.dummy_op("H", cdlt.node.inputs[0].shape[2])
-        W = cdlt.dummy_op("W", cdlt.node.inputs[0].shape[3])
-        op1 = cdlt.create_operand_template("op1", OP_DTYPES, [N, C, H, W], default_dtype=acc_dtype)
+        # H = cdlt.dummy_op("H", cdlt.node.inputs[0].shape[2])
+        # W = cdlt.dummy_op("W", cdlt.node.inputs[0].shape[3])
+        op1 = cdlt.create_operand_template("op1", OP_DTYPES, [N, C], default_dtype=acc_dtype)
         cdlt.set_inputs([op1])
 
-        out = cdlt.create_operand_template("out_exp", OP_DTYPES, [N, C, H, W], default_dtype=acc_dtype)
+        out = cdlt.create_operand_template("out_exp", OP_DTYPES, [N, C], default_dtype=acc_dtype)
         cdlt.set_outputs([out])
         cdlt.configure("start", "SIMD")
         # fix C dim to array size
         with cdlt.loop(N) as n:
             with cdlt.loop(C) as c:
-                with cdlt.loop(H) as h:
-                    with cdlt.loop(W) as w:
+                # with cdlt.loop(H) as h:
+                #     with cdlt.loop(W) as w:
 
-                        cdlt.transfer(op1, ["DRAM", "VMEM1"])
-                        out.set_write_destination("VMEM2")
-                        cdlt.compute("EXP", [op1[n, c, h, w]], [out[n, c, h, w]], target="SIMD")
-                        cdlt.transfer(out, ["VMEM2", "DRAM"])
+                cdlt.transfer(op1, ["DRAM", "VMEM1"])
+                out.set_write_destination("VMEM2")
+                cdlt.compute("EXP", [op1[n, c]], [out[n, c]], target="SIMD")
+                cdlt.transfer(out, ["VMEM2", "DRAM"])
         cdlt.configure("end", "SIMD")
     cdlt = add_simd_constraint(hag, cdlt, "C")
 
@@ -464,8 +464,9 @@ def elem_pow3d(hag: ArchitectureNode):
                     cdlt.compute("POW", [op1[n, c, h], out[n, c,h ]], [out[n, c,h ]], target="SIMD")
                     cdlt.transfer(out, ["VMEM2", "DRAM"])
         cdlt.configure("end", "SIMD")
-    # cdlt = add_simd_constraint(hag, cdlt, "C")
-    cdlt = add_flex_simd_constraints(hag, cdlt, ["N", "C", "H"])
+    cdlt = add_simd_constraint(hag, cdlt, "C")
+
+
     return cdlt
 
 def tensor_transpose2d(hag: ArchitectureNode):
@@ -559,7 +560,7 @@ def tensor_transpose4d(hag: ArchitectureNode):
         W = cdlt.dummy_op("W", cdlt.node.inputs[0].shape[3])
 
         data = cdlt.create_operand_template("data", OP_DTYPES, [N, C, H, W], default_dtype=acc_dtype)
-        out = cdlt.create_operand_template("out", OP_DTYPES, [N, C, W, H], default_dtype=acc_dtype)
+        out = cdlt.create_operand_template("out", OP_DTYPES, [N, H, C, W], default_dtype=acc_dtype)
 
         cdlt.set_inputs([data])
         cdlt.set_outputs([out])
@@ -581,7 +582,7 @@ def tensor_transpose4d(hag: ArchitectureNode):
                     with cdlt.loop(H) as h:
                         cdlt.transfer(data, ["DRAM", "VMEM1"])
                         out.set_write_destination("VMEM2")
-                        cdlt.compute("TRANSPOSE", [data[n, c, h, w]], [out[n, c, w, h]], target="SIMD")
+                        cdlt.compute("TRANSPOSE", [data[n, c, h, w]], [out[n, h, c, w]], target="SIMD")
                         cdlt.transfer(out, ["VMEM2", "DRAM"])
         cdlt.configure("end", "SIMD")
 

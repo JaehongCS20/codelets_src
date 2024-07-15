@@ -11,6 +11,8 @@
 	"USE_QUANTIZATION": false,
 	"ALL_QUANT_OFF": true,
 	"FUSION_CONSTRAINTS": true,
-	"FUSE_LAYERS": true,
+	"FUSE_LAYERS": false,
+	"SW_PIPELINE_TEST": true,
+	"SINGLE_PROGRAM_COMPILATION": true,
 	"SA_TILE_CONSTR": true
 }

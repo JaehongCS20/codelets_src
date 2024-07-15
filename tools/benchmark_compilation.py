@@ -1,6 +1,8 @@
 import argparse
 import os
 import numpy as np
+import json
+import subprocess
 
 import sys
 from collections import defaultdict
@@ -20,6 +22,8 @@ from tools.compile_layer import store_program_codelets
 import onnxruntime as ort
 from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference
 import onnx
+from time import time
+
 CWD = Path(f"{Path(__file__).parent}")
 MODEL_DIR = Path(f"{Path(__file__).parent}/../benchmarks/models")
 CFG_PATH = f"{CWD}/../codelets/examples/genesys/configs"
@@ -57,8 +61,9 @@ BENCHMARK_INFO = {
         "fused_skipped": []
     },
     "bert-base-cased-transpose-opt-trimmed-ort": {
-        "num_layers_unfused": 0,
+        "num_layers_unfused": 655,
         "num_layers_fused": 0,
+        "fuse_skipped": []
     },
     "yolov3-opt-static": {
         "num_layers_unfused": 172,
@@ -156,6 +161,7 @@ def compile_benchmark(model_name,
                       count_compute=False,
                       check_layer_count=False,
                       conv_tile_constraints=None,
+                      simd_only=False,
                       dir_ext=None
                       ):
     arch_config = load_config(f"{CWD}/../codelets/examples/genesys/configs/{cfg_name}")
@@ -175,15 +181,18 @@ def compile_benchmark(model_name,
 
 
     model_path = f"{MODEL_DIR}/{model_name}.onnx"
+    cfg_path = f"{CFG_PATH}/{cfg_name}"
     graph = pm.from_onnx(model_path)
-    program = compile_full_model(model_name, arch_config,
+    program, _ = compile_full_model(model_name, cfg_path,
                                  store_compile=False,
                                  dir_ext=None,
                                  added_constr=None,
                                  verbose=verbose,
                                  model_data=None,
+                                 fuse_layers=arch_config['FUSE_LAYERS'],
                                  generate_data=False,
-                                    graph=graph)
+                                    graph=graph,
+                                    batch_size=arch_config['BATCH_SIZE'])
 
     if conv_tile_constraints is not None:
         conv_layers = ["conv_bias", "conv_bias_add_relu", "conv_bias_relu"]
@@ -213,6 +222,7 @@ def compile_benchmark(model_name,
         program.filtered_compile(filtered_layers, verbose=verbose, finalize=True, filter_op_types=filter_op_types)
     elif skip_layers:
         assert filtered_layers is None
+        skip_layers = [skip_layer if skip_layer >= 0 else num_layers + skip_layer for skip_layer in skip_layers]
         all_layers = [i for i in range(num_layers) if i not in skip_layers]
         program.filtered_compile(all_layers, verbose=verbose, finalize=True, filter_op_types=filter_op_types)
     elif filter_op_types:
@@ -223,6 +233,8 @@ def compile_benchmark(model_name,
         assert isinstance(skip_op_types, list)
         if verbose:
             print(f"Performing full compilation of {model_name}, skipping layers {skip_op_types}.")
+        if simd_only:
+            skip_op_types += ["conv_bias", "gemm", "gemm_no_bias", "conv"]
         program.filtered_compile(verbose=verbose, finalize=True, skip_op_types=skip_op_types)
     else:
         if verbose:
@@ -308,9 +320,218 @@ def neuro_benchmarks():
                       # filtered_layers=layer,
                       identifier=0)
 
+
+def run_micro_tutorial_2023_systolic_size_sweep_variable_memory_depth_benchmarks() -> None:
+    models = [
+            "resnet50",
+            "bert-base-cased-transpose-opt-trimmed-ort"
+        ]
+    default_config_values = {
+        "PARAM_BUF_CHANNEL_BW": 512,
+        "DRAM_DEPTH": 50000000,
+        "SA_TILE_CONSTR": True,
+        "USE_QUANTIZATION": False,
+        "ALL_QUANT_OFF": True,
+        "FUSION_CONSTRAINTS": False,
+	    "FUSE_LAYERS": False,
+        "SINGLE_PROGRAM_COMPILATION": False,
+        "DATAGEN": False
+    }
+
+    systolic_array_widths = [4, 8, 16, 32, 64, 128, 256]
+    ibuf_depths = [32768, 16384, 8192, 4096, 2048, 1024, 512]
+    wbuf_depths = [32768, 16384, 4096, 1024, 256, 128, 512]
+    obuf_depths = [8192, 4096, 2048, 1024, 1024, 1024, 1024]
+    bbuf_depths = [4096, 2048, 1024, 512, 256, 512, 64]
+
+    configs = []
+    for i in range(len(systolic_array_widths)):
+        config = default_config_values.copy()
+        config["ARRAY_M"] = systolic_array_widths[i]
+        config["ARRAY_N"] = systolic_array_widths[i]
+        config["IBUF_DEPTH"] = ibuf_depths[i]
+        config["WBUF_DEPTH"] = wbuf_depths[i]
+        config["OBUF_DEPTH"] = obuf_depths[i]
+        config["BBUF_DEPTH"] = bbuf_depths[i]
+        configs.append(config)
+    
+    for config in configs[0:]:
+        for model in models:
+            config_file_path = "../codelets/examples/genesys/configs/micro_tutorial_2023_systolic_size_sweep_variable_memory_depth.json"
+            if os.path.exists(config_file_path):
+                os.remove(config_file_path)
+            with open(config_file_path, "w") as f:
+                json.dump(config, f, indent=4)
+            skip_layers = [-1] if model == "bert-base-cased-transpose-opt-trimmed-ort" else None
+            compile_benchmark(model, "micro_tutorial_2023_systolic_size_sweep_variable_memory_depth.json", verbose=False, only_systolic=False, skip_layers=skip_layers, identifier="micro_tutorial_2023_layer_by_layer_systolic_size_sweep_variable_memory_depth")
+            output_directory = f"compilation_output/{model}_benchmark{config['ARRAY_M']}x{config['ARRAY_N']}_micro_tutorial_2023_layer_by_layer_systolic_size_sweep_variable_memory_depth" 
+            assert os.path.exists(output_directory), f"Output directory {output_directory} does not exist."
+            subprocess.run(["zip", "-r", f"{model}_{config['ARRAY_M']}x{config['ARRAY_N']}_micro_tutorial_2023_layer_by_layer_systolic_size_sweep_variable_memory_depth.zip", output_directory])
+            os.remove(config_file_path)
+            print(f"Successfully created {model}_{config['ARRAY_M']}x{config['ARRAY_N']}_micro_tutorial_2023_layer_by_layer_systolic_size_sweep_variable_memory_depth.zip")
+
+
+def run_micro_tutorial_2023_systolic_array_size_sweep_fusion_on_off() -> None:
+    models = [
+            "resnet50",
+            "bert-base-cased-transpose-opt-trimmed-ort"
+        ]
+    default_config_values = {
+        "IBUF_DEPTH": 32768,
+        "WBUF_DEPTH": 32768,
+        "OBUF_DEPTH": 8192,
+        "BBUF_DEPTH": 4096,
+        "PARAM_BUF_CHANNEL_BW": 512,
+        "DRAM_DEPTH": 50000000,
+        "SA_TILE_CONSTR": True,
+        "USE_QUANTIZATION": False,
+        "ALL_QUANT_OFF": True, 
+        "SINGLE_PROGRAM_COMPILATION": False,
+        "DATAGEN": False
+    }
+
+    systolic_array_widths = [4, 8, 16, 32, 64, 128, 256]
+    configs = []
+    for i in range(len(systolic_array_widths)):
+        config = default_config_values.copy()
+        config["ARRAY_M"] = systolic_array_widths[i]
+        config["ARRAY_N"] = systolic_array_widths[i]
+        config["FUSION_CONSTRAINTS"] = False
+        config["FUSE_LAYERS"] = False
+        configs.append(config)
+        config = configs[-1].copy()
+        config["FUSION_CONSTRAINTS"] = True
+        config["FUSE_LAYERS"] = True
+        configs.append(config)
+    
+    for config in configs[0:]:
+        for model in models:
+            config_file_path = "../codelets/examples/genesys/configs/micro_tutorial_2023_systolic_size_sweep_fusion_on_off.json"
+            if os.path.exists(config_file_path):
+                os.remove(config_file_path)
+            with open(config_file_path, "w") as f:
+                json.dump(config, f, indent=4)
+            skip_layers = [-1] if model == "bert-base-cased-transpose-opt-trimmed-ort" and not config["FUSE_LAYERS"] else None
+            compile_benchmark(model, "micro_tutorial_2023_systolic_size_sweep_fusion_on_off.json", verbose=False, only_systolic=False, skip_layers=skip_layers, identifier="micro_tutorial_2023_layer_by_layer_systolic_size_sweep_fusion_on_off")
+            output_directory = f"compilation_output/{model}_benchmark{config['ARRAY_M']}x{config['ARRAY_N']}_micro_tutorial_2023_layer_by_layer_systolic_size_sweep_fusion_on_off" 
+            assert os.path.exists(output_directory), f"Output directory {output_directory} does not exist."
+            subprocess.run(["zip", "-r", f"{model}_{config['ARRAY_M']}x{config['ARRAY_N']}_micro_tutorial_2023_layer_by_layer_systolic_size_sweep_fusion_on_off.zip", output_directory])
+            os.remove(config_file_path)
+            print(f"Successfully created {model}_{config['ARRAY_M']}x{config['ARRAY_N']}_micro_tutorial_2023_layer_by_layer_systolic_size_sweep_fusion_on_off.zip")
+
+
+def run_micro_tutorial_2023_systolic_array_size_sweep_quantization_on_off() -> None:
+    models = [
+            "resnet50",
+            "bert-base-cased-transpose-opt-trimmed-ort"
+        ]
+    default_config_values = {
+        "IBUF_DEPTH": 32768,
+        "WBUF_DEPTH": 32768,
+        "OBUF_DEPTH": 8192,
+        "BBUF_DEPTH": 4096,
+        "PARAM_BUF_CHANNEL_BW": 512,
+        "DRAM_DEPTH": 50000000,
+        "FUSION_CONSTRAINTS": False,
+	    "FUSE_LAYERS": False,
+        "SA_TILE_CONSTR": True,
+        "SINGLE_PROGRAM_COMPILATION": False,
+        "DATAGEN": False
+    }
+
+    systolic_array_widths = [4, 8, 16, 32, 64, 128, 256]
+    configs = []
+    for i in range(len(systolic_array_widths)):
+        config = default_config_values.copy()
+        config["ARRAY_M"] = systolic_array_widths[i]
+        config["ARRAY_N"] = systolic_array_widths[i]
+        config["USE_QUANTIZATION"] = False
+        config["ALL_QUANT_OFF"] = True
+        configs.append(config)
+        config = configs[-1].copy()
+        config["USE_QUANTIZATION"] = True
+        config["ALL_QUANT_OFF"] = False
+        configs.append(config)
+    
+    for config in configs[0:]:
+        for model in models:
+            config_file_path = "../codelets/examples/genesys/configs/micro_tutorial_2023_systolic_size_sweep_quantization_on_off.json"
+            if os.path.exists(config_file_path):
+                os.remove(config_file_path)
+            with open(config_file_path, "w") as f:
+                json.dump(config, f, indent=4)
+            skip_layers = [-1] if model == "bert-base-cased-transpose-opt-trimmed-ort" and not config["FUSE_LAYERS"] else None
+            compile_benchmark(model, "micro_tutorial_2023_systolic_size_sweep_quantization_on_off.json", verbose=False, only_systolic=False, skip_layers=skip_layers, identifier="micro_tutorial_2023_layer_by_layer_systolic_size_sweep_quantization_on_off")
+            output_directory = f"compilation_output/{model}_benchmark{config['ARRAY_M']}x{config['ARRAY_N']}_micro_tutorial_2023_layer_by_layer_systolic_size_sweep_quantization_on_off" 
+            assert os.path.exists(output_directory), f"Output directory {output_directory} does not exist."
+            subprocess.run(["zip", "-r", f"{model}_{config['ARRAY_M']}x{config['ARRAY_N']}_micro_tutorial_2023_layer_by_layer_systolic_size_sweep_quantization_on_off.zip", output_directory])
+            os.remove(config_file_path)
+            print(f"Successfully created {model}_{config['ARRAY_M']}x{config['ARRAY_N']}_micro_tutorial_2023_layer_by_layer_systolic_size_sweep_quantization_on_off.zip")
+
+def model_compile(model_name, batch, seq, init_or_gen, arch_config, gen_ORCA=None, init_ORCA=None, verbose=False):
+
+    # initiation phase
+    if init_or_gen == 'init':
+        if gen_ORCA == None and init_ORCA == None:
+            if 'llama' in model_name:
+                models = ['-embd-opt', '-rms-opt', '-rattn-opt', '-proj-opt', '-linswi-opt']
+            else:
+                models = ['-embd-opt', '-ln-opt', '-attn-opt', '-proj-opt', '-linear1-opt', '-linear2-opt']
+        else:
+            if 'llama' in model_name:
+                models = ['-embd-opt', '-rms-opt', '-qkv-opt', '-proj-opt', '-linswi-opt']
+            else:
+                models = ['-embd-opt', '-ln-opt', '-qkv-opt', '-proj-opt', '-linear1-opt', '-linear2-opt']
+
+    # generation phase
+    else:
+        if gen_ORCA == None and init_ORCA == None:
+            if 'llama' in model_name:
+                models = ['-rgen-opt']
+            else:
+                models = ['-gen-opt']
+        else:
+            models = []
+            gen_len = 0
+            if gen_ORCA != None:
+                for i in gen_ORCA:
+                    if 'llama' in model_name:
+                        models.append(f'-rgen-{i}-opt')
+                    else:
+                        models.append(f'-gen-{i}-opt')
+                    gen_len += 1
+            if init_ORCA != None:
+                for i in init_ORCA:
+                    if 'llama' in model_name:
+                        models.append(f'-rinit-{i}-opt')
+                    else:
+                        models.append(f'-init-{i}-opt')
+
+    for i, model in enumerate(models):
+        model = model_name + model
+        if (gen_ORCA == None and init_ORCA == None) or init_or_gen == 'init':
+            extension=f"b{batch}_s{seq}_{init_or_gen}"
+        else:
+            if 'gen' in model:
+                extension=f"b{batch}_s{gen_ORCA[i]}_gen"
+            else:
+                extension=f"b{batch}_s{init_ORCA[i-gen_len]}_init"
+        # start = time()
+        compile_benchmark(model,
+                        arch_config,
+                        only_systolic=False,
+                        skip_op_types=["unsqueeze", "concat5d"],
+                        verbose=verbose,
+                        skip_broken_layers=False,
+                        identifier=extension)
+        # end = time()
+        # print(f"{model} compilation time: {end-start}")
+        
+
 if __name__ == "__main__":
-    if sys.stdin and sys.stdin.isatty():
-    # if False:
+    run_specific_benchmarks: bool = True
+    # if sys.stdin and sys.stdin.isatty():
+    if not run_specific_benchmarks:
         argparser = argparse.ArgumentParser(description='ONNX Benchmark Generator')
         argparser.add_argument('-m', '--model', required=True,
                                help='Name of the onnx model to create.')
@@ -330,78 +551,29 @@ if __name__ == "__main__":
         extension = args.extension
         verbose = args.verbose
         arch_config = args.config
+
         compile_benchmark(fname,
                           arch_config,
                           only_systolic=False,
-                          verbose=args.verbose,
+                        #   sw_pipeline_test=False,
+                        #   addr_gen_test=False,
+                        #   custom_config=False,
+                          skip_op_types=["unsqueeze", "concat5d"],
+                          verbose=verbose,
                           skip_broken_layers=False,
-                          dir_ext=args.extension,
-                          identifier=0)
-
+                          identifier=extension)
     else:
-        # config = "simd_paper32x32.json"
+        # run_micro_tutorial_2023_systolic_size_sweep_variable_memory_depth_benchmarks()
+        # run_micro_tutorial_2023_systolic_array_size_sweep_fusion_on_off()
 
-        # config = "simd_paper8x8_dse.json"
-        # config = "simd_paper16x16_dse.json"
-        # config = "simd_paper32x32_dse.json"
-        # config = "simd_paper64x64_dse.json"
-        # config = "simd_paper128x128_dse.json"
-        # config = "paper_fpga16x16.json"
-        # config = "fpga16x16.json"
-        config = "fpga4x4.json"
-        # config = "neuro_cfg_8x8.json"
-
-        # dir_ext = "_default"
-        # dir_ext = "_tpu_test"
-        # dir_ext = "_ld_st"
-        # dir_ext = "_addr_gen"
-        # dir_ext = "_loop_overhead"
-        # dir_ext = "_sw_pipeline"
-        # dir_ext = "unfused_"
-        dir_ext = ""
-
-        benchmarks = ['resnet18', # 0
-                      'resnet50', # 1
-                      'efficientnet-lite4-opt-no-softmax', # 2
-                      'mobilenetv2-opt', # 3
-                      'yolov3-opt-static', # 4
-                      'bert-base-cased-transpose-opt-trimmed-ort', # 5
-                      "vgg16", # 6
-                      'gpt2-trimmed-opt', # 7
-                      "vit-pad256-transpose-ort", # 8
-                      "custom_fft", # 9
-                      "custom_small_fft", # 10
-                      "resnet50_train", # 11
-                      "resnet18_train", # 12
-                      'conv_clip_depthwise_c32_w112_kw1', # 13
-                      'conv_lrelu_add_oc64_v3-opt', # 14
-                      'conv_lrelu_oc64', # 15
-                      'conv_clip_depthwise_v1-opt', # 16
-                      'fcn-resnet101-trimmed-opt', # 17
-                      'mel_scale',# # 18,
-                      'normalize-200-opt', # 19
-                      'linear_reg-opt', # 20
-                      'logistic_reg-opt', # 21
-                      'linear_reg_test', # 22
-                      'ppo_model', # 23,
-                      'conv_benchmark_v1', # 24
-                      'div_test', # 25,
-                      'conv_lrelu_add_v1-opt', # 26
-                      'conv_add_relu_v0-opt', # 27
-                      "conv_benchmark_v1", # 28
-                      'ddpg_model-opt',  # 29
-                      'sac_model',  # 30
-                      'ppo_model',  # 31,
-                      'ddpg', # 32,
-                      'short-gpt2-trimmed-opt', # 33
-                      ]
-        # neuro_benchmarks()
-        simd_paper_benches = [1, 3, 4, 2, 6, 5]
-        compile_benchmark(benchmarks[31],
-                          config,
-                          only_systolic=False,
-                          verbose=True,
-                          skip_broken_layers=False,
-                          # filtered_layers=[0],
-                          dir_ext=dir_ext,
-                          identifier=8)
+        model_name = 'llama-7b-'
+        models = ['rinit-256-opt' , 'gen-256-opt', 'rgen-256-opt']
+        for model in models:
+            model = model_name + model
+            compile_benchmark(model,
+                            'benchmark_128x128.json',
+                            only_systolic=False,
+                            skip_op_types=["unsqueeze", "concat5d"],
+                            verbose=True,
+                            skip_broken_layers=False,
+                            identifier='')

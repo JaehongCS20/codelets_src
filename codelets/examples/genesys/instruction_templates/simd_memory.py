@@ -6,14 +6,17 @@ def imm_start_template(hag: ComputeNode):
     instructions = []
     # program.extract_bits({stride_size_str}, 16, 16)
     imm_val = "op.get_config_param_value('immediate_value')"
-    bitwidth = f"len(np.binary_repr({imm_val})) + int(np.signbit({imm_val}))"
-    bitwidth_cond = f"{bitwidth} <= 16"
+
+    # bitwidth = f"len(np.binary_repr({imm_val})) + int(np.signbit({imm_val}))"
+    # bitwidth_cond = f"{bitwidth} <= 16"
+    imm_width = "16"
+    bitwidth_cond = f"({imm_val} <= (2 ** ({imm_width} - 1) - 1)) and ({imm_val} >= -(2 ** ({imm_width} - 1)))"
 
     instr = hag.get_primitive_template("IMM_SIGN_EXT")
     instr.set_field_by_name("NS_ID", "IMM")
     instr.add_condition(bitwidth_cond)
     instr.set_field_flex_param("NS_INDEX_ID", f"op.get_config_param_value('index')")
-    instr.set_field_flex_param("IMM", imm_val)
+    instr.set_field_flex_param("IMM", f"program.extract_bits({imm_val}, 16, 0)")
     instructions.append(instr)
 
     instr = hag.get_primitive_template("SET_IMM_LOW")

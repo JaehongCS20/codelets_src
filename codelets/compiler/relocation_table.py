@@ -1,5 +1,5 @@
 import abc
-from typing import Any, Dict, Final, Optional, Union
+from typing import Any, Callable, Dict, Final, Optional, Union
 from dataclasses import dataclass, field
 from collections import deque
 import polymath as pm
@@ -130,15 +130,13 @@ class RelocationTable(abc.ABC):
                 return k
         raise KeyError(f"Unable to find relocation for {name}")
     
-    def get_operand_namespace(self, operand: Operand) -> str:
-        for mem_loc in operand.data_path:
-            if mem_loc in self.mem_ns_mapping:
-                return self.mem_ns_mapping[mem_loc]
-        raise RuntimeError(f"Unable to find namespace for operand {operand.node_name} with path {operand.data_path}")
-    
     def get_namespace_size(self, namespace: str) -> int:
         reloc: Relocation = self.relocatables[namespace]
         return reloc.total_length()
+    
+    @abc.abstractmethod
+    def get_operand_namespace(self, operand: Operand) -> str:
+        ...
     
     @abc.abstractmethod
     def add_data_relocation(self, node: pm.Node, cdlt: Codelet) -> None:
@@ -150,6 +148,10 @@ class RelocationTable(abc.ABC):
     
     @abc.abstractmethod
     def get_input_namespace_size(self) -> int:
+        ...
+    
+    @abc.abstractmethod
+    def finalize_memory(self) -> None:
         ...
 
 
@@ -185,6 +187,12 @@ class DebugRelocationTable(RelocationTable):
     
     def get_input_namespace_size(self) -> int:
         return self.get_namespace_size('SA_INPUTS')
+    
+    def get_operand_namespace(self, operand: Operand) -> str:
+        for mem_loc in operand.data_path:
+            if mem_loc in self.mem_ns_mapping:
+                return self.mem_ns_mapping[mem_loc]
+        raise RuntimeError(f"Unable to find namespace for operand {operand.node_name} with path {operand.data_path}")
 
     def print_layout(self):
         base = 0
@@ -274,6 +282,9 @@ class DebugRelocationTable(RelocationTable):
             self.update_relocation_offset(ns, o.name, data_size)
 
         self.update_namespace_offsets()
+    
+    def finalize_memory(self) -> None:
+        pass
 
 
 class _DataflowGraphNode:
@@ -348,10 +359,12 @@ class _DataflowGraphEdge:
 class _DataflowGraph:
     _inputs: list[_DataflowGraphEdge]
     _graph: dict[_DataflowGraphNode, list[_DataflowGraphEdge]]
+    _most_recently_added_node: Optional[_DataflowGraphNode]
 
     def __init__(self) -> None:
         self._inputs = []
         self._graph = {}
+        self._most_recently_added_node = None
     
     def _get_operands_stored_at_each_layer(self) -> dict[_DataflowGraphNode, list[str]]:
         operands_stored_at_each_layer: dict[_DataflowGraphNode, list[str]] = {}
@@ -417,7 +430,7 @@ class _DataflowGraph:
         top_order: list[_DataflowGraphNode] = []
         
         while queue:
-            node = queue.popleft()
+            node: _DataflowGraphNode = queue.popleft()
             top_order.append(node)
             for neighbor in self._graph.get(node, []):
                 if neighbor.destination_node is not None:
@@ -434,23 +447,40 @@ class _DataflowGraph:
                     indegree[edge.destination_node] += 1
         return indegree
 
-    def append_node(self, node: _DataflowGraphNode, inputs: list[tuple[str, Operand]], outputs: list[tuple[str, Operand]]) -> None:
-        self.add_node(node)
-        for input_name, input_operand in inputs:
+    def append_node(self, node: _DataflowGraphNode, inputs: list[tuple[str, Operand, bool]], outputs: list[tuple[str, Operand]]) -> None:
+        for input_name, input_operand, is_output_of_other_node in inputs:
             source_node: Optional[_DataflowGraphNode] = self.get_node_operand_is_output_of(input_name)
+            """
+            This logic is pretty confusing because it is just duct tape to get this working.
+            Essentially, if the source_node is None, then we know that the input is either an input to the graph
+            or there is a missing node. This can happen because operations like flatten are not mapped to code.
+            This is handled accordingly as seen below.
+            If the source node is found, then an edge is added from that node to the current node only if there is not already
+            an empty edge there that used to be the output edge for the graph.
+            """
             if source_node is None:
-                self.add_input_edge(_DataflowGraphEdge(input_name, input_operand, node))
+                if is_output_of_other_node:
+                    self.add_edge(self._most_recently_added_node, _DataflowGraphEdge(input_name, input_operand, node))
+                else:
+                    self.add_input_edge(_DataflowGraphEdge(input_name, input_operand, node))
             else:
+                is_edge_added: bool = False
                 for edge in self._graph[source_node]:
-                    if edge.operand_name == input_name:
+                    if (edge.operand_name == input_name) and (edge.destination_node is None):
                         edge._destination_node = node
+                        is_edge_added = True
                         break
+                if not is_edge_added:
+                    self.add_edge(source_node, _DataflowGraphEdge(input_name, input_operand, node))
         
+        self.add_node(node)
+
         for output_name, output_operand in outputs:
             self.add_edge(node, _DataflowGraphEdge(output_name, output_operand, None))
-    
+        
     def add_node(self, node: _DataflowGraphNode) -> None:
         self._graph[node] = []
+        self._most_recently_added_node = node
 
     def add_input_edge(self, edge: _DataflowGraphEdge) -> None:
         self._inputs.append(edge)
@@ -500,6 +530,144 @@ class _DataflowGraph:
         return ret
 
 
+class _MemoryAllocator(abc.ABC):
+    @abc.abstractmethod
+    def generate_tensor_offsets(self) -> dict[str, int]:
+        ...
+
+
+# Greedy algorithm for DNN intermediate tensor allocation taken from "EFFICIENT MEMORY MANAGEMENT FOR DEEP NEURAL NET INFERENCE"
+class _GreedyBySizeMemoryAllocator(_MemoryAllocator):
+    _dataflow_graph: _DataflowGraph
+    _operand_name_to_operand_map: dict[str, Operand]
+    _get_operand_namespace: Callable[[Operand], str]
+    _get_aligned_size: Callable[[int], int]
+
+    def __init__(self, dataflow_graph: _DataflowGraph, operand_name_to_operand_map: dict[str, Operand], get_operand_namespace_func: Callable[[Operand], str], get_aligned_size_func: Callable[[int], int]) -> None:
+        super().__init__()
+        self._dataflow_graph = dataflow_graph
+        self._operand_name_to_operand_map = operand_name_to_operand_map
+        self._get_operand_namespace = get_operand_namespace_func
+        self._get_aligned_size = get_aligned_size_func
+    
+    def generate_tensor_offsets(self) -> dict[str, int]:
+        input_tensors: list[str] = [e.operand_name for e in self._dataflow_graph.get_input_edges()]
+        intermediate_tensor_usage_records: dict[str, tuple[int, int, int]] = self._generate_intermediate_tensor_usage_records()
+        assigned_intermediate_tensor_offsets: dict[str, Optional[int]] = {k: None for k in intermediate_tensor_usage_records.keys()}
+        ordered_allocated_tensor_names: list[str] = [] 
+
+        # Assign input tensors to the beginning of the activation memory
+        current_input_offset: int = 0
+        for tensor_name in input_tensors:
+            input_operand: Operand = self._operand_name_to_operand_map[tensor_name]
+            if self._get_operand_namespace(input_operand) != "ACTIVATION":
+                continue
+            ordered_allocated_tensor_names.append(tensor_name)
+            aligned_size: int = self._get_aligned_size(np.prod(input_operand.shape) * input_operand.dtype.bits(), as_bytes=False) 
+            intermediate_tensor_usage_records[tensor_name] = (0, 0, aligned_size)
+            assigned_intermediate_tensor_offsets[tensor_name] = current_input_offset
+            current_input_offset += aligned_size
+        
+        # Assign intermediate tensors greedily
+        total_memory_consumption: int = 0
+        for tensor_name, (start_layer_index, end_layer_index, size) in sorted(intermediate_tensor_usage_records.items(), key=lambda x: x[1][2], reverse=True):
+            previous_offset: int = 0
+            best_offset: Optional[int] = None
+            smallest_gap: Optional[int] = None
+            for allocated_tensor_name in ordered_allocated_tensor_names:
+                max_first_node_index: int = max(intermediate_tensor_usage_records[allocated_tensor_name][0], start_layer_index)
+                min_last_node_index: int = min(intermediate_tensor_usage_records[allocated_tensor_name][1], end_layer_index)
+                if max_first_node_index <= min_last_node_index:
+                    gap: int = assigned_intermediate_tensor_offsets[allocated_tensor_name] - previous_offset
+                    if gap >= size:
+                        if smallest_gap is None or gap < smallest_gap:
+                            smallest_gap = gap
+                            best_offset = previous_offset
+                    previous_offset = max(previous_offset, assigned_intermediate_tensor_offsets[allocated_tensor_name] + intermediate_tensor_usage_records[allocated_tensor_name][2])
+            if best_offset is None:
+                best_offset = previous_offset
+            
+            assigned_intermediate_tensor_offsets[tensor_name] = best_offset
+            total_memory_consumption = max(total_memory_consumption, best_offset + size)
+            ordered_allocated_tensor_names.append(tensor_name)
+
+        if any(offset is None for offset in assigned_intermediate_tensor_offsets.values()):
+            raise RuntimeError("Unable to allocate all intermediate tensors")
+     
+        return {k: v for k, v in assigned_intermediate_tensor_offsets.items() if v is not None}
+
+    def _generate_intermediate_tensor_usage_records(self) -> dict[str, tuple[int, int, int]]:
+        input_tensors: list[str] = [e.operand_name for e in self._dataflow_graph.get_input_edges()]
+        tensor_usage_records: dict[str, tuple[Optional[int], Optional[int], int]] = {}
+        node_order: list[_DataflowGraphNode] = self._dataflow_graph.topological_sort()
+        operands_stored_at_each_layer: dict[_DataflowGraphNode, list[str]] = self._dataflow_graph._get_operands_stored_at_each_layer()
+        for i, node in enumerate(node_order):
+            operands_stored_at_node_layer: list[str] = operands_stored_at_each_layer[node]
+            for operand_name in operands_stored_at_node_layer:
+                operand: Operand = self._operand_name_to_operand_map[operand_name]
+                operand_location: str = self._get_operand_namespace(operand)
+                data_size: int = np.prod(operand.shape) * operand.dtype.bits()
+                aligned_size: int = self._get_aligned_size(data_size, as_bytes=False)
+                if operand_location == "ACTIVATION" and operand_name not in input_tensors:
+                    if operand_name not in tensor_usage_records:
+                        tensor_usage_records[operand_name] = (i, i, aligned_size)
+                    else:
+                        tensor_usage_records[operand_name] = (tensor_usage_records[operand_name][0], i, tensor_usage_records[operand_name][2])
+
+        for tensor_usage_record in tensor_usage_records.values():
+            assert tensor_usage_record[0] is not None
+            assert tensor_usage_record[1] is not None
+
+        return tensor_usage_records
+ 
+    @staticmethod
+    def plot_memory_allocation(intermediate_tensor_usage_records: dict[str, tuple[int, int, int]], assigned_intermediate_tensor_offsets: dict[str, int]) -> None:
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+
+        num_tensors = len(intermediate_tensor_usage_records)
+        
+        if num_tensors <= 20:
+            colormap = plt.cm.get_cmap('tab20', num_tensors)
+        else:
+            hatch_patterns = ['/', '\\', '|', '-', '+', 'x', 'o', 'O', '.', '*']
+
+        for idx, (tensor_name, (start_op, end_op, size)) in enumerate(intermediate_tensor_usage_records.items()):
+            offset = assigned_intermediate_tensor_offsets[tensor_name]
+            
+            if num_tensors <= 20:
+                color = colormap(idx)
+                hatch = None
+            else:
+                color = np.random.rand(3)
+                hatch_idx = idx % len(hatch_patterns)
+                hatch = hatch_patterns[hatch_idx]
+            
+            # Create a rectangle patch
+            rect = patches.Rectangle((offset, start_op), size, end_op - start_op + 1, 
+                                    facecolor=color, edgecolor='black', hatch=hatch, label=tensor_name)
+            
+            # Add the rectangle to the axis
+            ax.add_patch(rect)
+
+        ax.set_xlabel('Memory Offset')
+        ax.set_ylabel('Operation Index')
+        ax.set_title('Memory Allocation of Tensors Over Operations')
+        
+        # Set vertical axis to be integer only and have ticks for each operation index
+        ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        all_operations = [record[0] for record in intermediate_tensor_usage_records.values()] + \
+                        [record[1] for record in intermediate_tensor_usage_records.values()]
+        ax.set_yticks(np.arange(min(all_operations), max(all_operations)+1))
+        
+        ax.autoscale()
+        ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
+        plt.tight_layout()
+        plt.show()
+
+
 class EndToEndRelocationTable(RelocationTable):
     MEM_NS_MAPPING: dict[str, str] = {'VMEM1': 'ACTIVATION', 'VMEM2': 'ACTIVATION', 'IBUF': 'ACTIVATION', 'WBUF': 'WEIGHT_AND_BIAS',
                       'BBUF': 'WEIGHT_AND_BIAS', 'OBUF': 'ACTIVATION', 'INSTR_MEM': 'INSTR_MEM'}
@@ -507,26 +675,18 @@ class EndToEndRelocationTable(RelocationTable):
 
     _dataflow_graph: _DataflowGraph
     _operand_name_to_operand_map: dict[str, Operand]
-    _maximum_activation_buffer_size: int
-
-    _current_aligned_offset_for_activation_buffer: int = 0
+    _operand_to_operand_location_map: dict[int, str]
 
     def __init__(self, storage_node: StorageNode, mem_layout: Optional[list[str]] = None, offsets=None, addr_alignment=1) -> None:
-        super().__init__(storage_node, mem_layout or EndToEndRelocationTable.MEM_LAYOUT, EndToEndRelocationTable.MEM_NS_MAPPING)
+        super().__init__(storage_node, mem_layout or EndToEndRelocationTable.MEM_LAYOUT, EndToEndRelocationTable.MEM_NS_MAPPING, addr_alignment=addr_alignment)
         self._dataflow_graph = _DataflowGraph()
         self._operand_name_to_operand_map = {}
-        self._maximum_activation_buffer_size = 0
-
-        self._current_aligned_offset_for_activation_buffer = 0
-
-    @property
-    def maximum_activation_buffer_size(self) -> int:
-        return self._maximum_activation_buffer_size
+        self._operand_to_operand_location_map = {}
     
     def print_layout(self) -> None:
         print("====================================================")
         print("INFORMATION:")
-        print("\t- Activation buffer size: " + str(self.maximum_activation_buffer_size // 8) + " bytes")
+        print(f"Total Size: {self.get_total_size()}")
         print("====================================================")
 
         operands_stored_at_each_layer: dict[_DataflowGraphNode, str] = self._dataflow_graph._get_operands_stored_at_each_layer()
@@ -537,94 +697,97 @@ class EndToEndRelocationTable(RelocationTable):
             for ns in self.mem_layout:
                 reloc: Relocation = self.relocatables[ns]
                 sorted_fragments: list[tuple[Union[int, str], Fragment]] = sorted(reloc.bases.items(), key=lambda x: x[1].start)
-
-                if ns == "ACTIVATION":
-                    print("ACTIVATION_LOWER:") 
-                    for operand_id, memory_fragment in sorted_fragments:
-                        if operand_id in operands_stored_at_each_layer[node] and memory_fragment.start < (self.maximum_activation_buffer_size // 2):
-                            byte_start, byte_end = memory_fragment.start // 8, memory_fragment.end // 8
-                            print(f"\t{operand_id}[size={memory_fragment.size // 8}]: {byte_start} --> {byte_end}")
-                    print("ACTIVATION_UPPER:") 
-                    for operand_id, memory_fragment in sorted_fragments:
-                        if operand_id in operands_stored_at_each_layer[node] and memory_fragment.start >= (self.maximum_activation_buffer_size // 2):
-                            byte_start, byte_end = memory_fragment.start // 8, memory_fragment.end // 8
-                            print(f"\t{operand_id}[size={memory_fragment.size // 8}]: {byte_start} --> {byte_end}")
-                else:
-                    print(f"{ns}:") 
-                    for operand_id, memory_fragment in sorted_fragments:
-                        if operand_id in operands_stored_at_each_layer[node]:
-                            byte_start, byte_end = memory_fragment.start // 8, memory_fragment.end // 8
-                            print(f"\t{operand_id}[size={memory_fragment.size // 8}]: {byte_start} --> {byte_end}")
+                print(f"{ns}:") 
+                for operand_id, memory_fragment in sorted_fragments:
+                    if operand_id in operands_stored_at_each_layer[node] or ns == "INSTR_MEM":
+                        byte_start, byte_end = memory_fragment.start // 8, memory_fragment.end // 8
+                        print(f"\t{operand_id}[size={memory_fragment.size // 8}]: {byte_start} --> {byte_end}")
+    
+    def get_total_size(self) -> int:
+        max_end: int = 0
+        for ns in self.mem_layout:
+            reloc: Relocation = self.relocatables[ns]
+            sorted_fragments: list[tuple[Union[int, str], Fragment]] = sorted(reloc.bases.items(), key=lambda x: x[1].start)
+            # for layers that not use weight and bias
+            if len(sorted_fragments) != 0:
+                last_fragment: Fragment = sorted_fragments[-1][1]
+            max_end = max(max_end, last_fragment.end)
+        return max_end // 8
+    
+    def get_operand_namespace(self, operand: Operand) -> str:
+        return self._operand_to_operand_location_map[id(operand)]
+    
+    def add_operand_to_operand_namespace_mapping(self, pm_operand, operand: Operand) -> None:
+        operand_name: str = pm_operand.name
+        if operand_name not in self._operand_to_operand_location_map:
+            if isinstance(pm_operand, (pm.input, pm.output)):
+                self._operand_to_operand_location_map[id(operand)] = "ACTIVATION"
+            elif isinstance(pm_operand, pm.state):
+                self._operand_to_operand_location_map[id(operand)] = "WEIGHT_AND_BIAS" 
+            else:
+                raise RuntimeError(f"Unknown operand type {type(pm_operand)}")
     
     def get_input_namespace_size(self) -> int:
         return self.get_namespace_size('ACTIVATION')
 
     def add_data_relocation(self, node: pm.Node, cdlt: Codelet) -> None:
         operation_node = _DataflowGraphNode(node.name)
-        self._dataflow_graph.append_node(operation_node, [(i.name, inp) for i, inp in zip(node.inputs, cdlt.inputs)], [(o.name, out) for o, out in zip(node.outputs, cdlt.outputs)])
+        self._dataflow_graph.append_node(operation_node, [(i.name, inp, isinstance(i, pm.output)) for i, inp in zip(node.inputs, cdlt.inputs)], [(o.name, out) for o, out in zip(node.outputs, cdlt.outputs)])
         for node_input, cdlt_input in zip(node.inputs, cdlt.inputs):
+            self.add_operand_to_operand_namespace_mapping(node_input, cdlt_input)
             self._operand_name_to_operand_map[node_input.name] = cdlt_input
         for node_output, cdlt_output in zip(node.outputs, cdlt.outputs):
+            self.add_operand_to_operand_namespace_mapping(node_output, cdlt_output)
             self._operand_name_to_operand_map[node_output.name] = cdlt_output
-        self._update_maximum_activation_buffer_size()
         self._update_relocations()
-
-        # print("\n\nNew operation added to graph...\n\n")
-        # self.print_layout()
     
-    def _update_maximum_activation_buffer_size(self) -> None:
-        maximum_activation_buffer_size: int = 0
+    def _update_relocations(self) -> None: 
+        self.reset_reloctables()
+
+        allocator = _GreedyBySizeMemoryAllocator(self._dataflow_graph, self._operand_name_to_operand_map, self.get_operand_namespace, self.get_aligned_sized)
+        assigned_intermediate_tensor_offsets: dict[str, int] = allocator.generate_tensor_offsets()
+        
+        for tensor_name, offset in assigned_intermediate_tensor_offsets.items():
+            tensor_operand: Operand = self._operand_name_to_operand_map[tensor_name]
+            tensor_aligned_size: int = self.get_aligned_sized(np.prod(tensor_operand.shape) * tensor_operand.dtype.bits(), as_bytes=False)
+            self.update_relocation_offset("ACTIVATION", tensor_name, tensor_aligned_size, offset=offset)
+
+        self._update_weight_and_bias_relocation_offsets()
+    
+    def _update_weight_and_bias_relocation_offsets(self) -> None:
         operands_stored_at_each_layer: dict[_DataflowGraphNode, list[str]] = self._dataflow_graph._get_operands_stored_at_each_layer()
-        for node in self._dataflow_graph.get_nodes():
-            current_node_activation_buffer_size: int = 0
+        for node in self._dataflow_graph.topological_sort():
             operands_stored_at_node_layer: list[str] = operands_stored_at_each_layer[node]
             for operand_name in operands_stored_at_node_layer:
                 operand: Operand = self._operand_name_to_operand_map[operand_name]
                 operand_location: str = self.get_operand_namespace(operand)
-                data_size: int = np.prod(operand.shape) * operand.dtype.bits() 
-                if operand_location == "ACTIVATION":
-                    current_node_activation_buffer_size += self.get_aligned_sized(data_size, as_bytes=False)
-            maximum_activation_buffer_size = max(maximum_activation_buffer_size, current_node_activation_buffer_size)
-        self._maximum_activation_buffer_size = 2 * self.get_aligned_sized(maximum_activation_buffer_size, as_bytes=False)
-
-    def _update_relocations(self) -> None:
-        self.reset_reloctables()
-        is_first_half_of_activation_buffer: bool = True
-        operands_stored_at_each_layer: dict[_DataflowGraphNode, set[str]] = self._dataflow_graph._get_operands_stored_at_each_layer()
-        for node in self._dataflow_graph.get_nodes():
-            self._reset_current_aligned_offset_for_activation_buffer()
-            operands_stored_at_node_layer: set[str] = operands_stored_at_each_layer[node]
-            for operand_name in operands_stored_at_node_layer:
-                operand: Operand = self._operand_name_to_operand_map[operand_name]
-                operand_location: str = self.get_operand_namespace(operand)
-                data_size: int = np.prod(operand.shape) * operand.dtype.bits()
-                self.update_relocation_offset(operand_location, operand_name, data_size, is_first_half_of_activation_buffer=is_first_half_of_activation_buffer)
-            is_first_half_of_activation_buffer = not is_first_half_of_activation_buffer
-
+                if operand_location == "WEIGHT_AND_BIAS":
+                    self.update_relocation_offset("WEIGHT_AND_BIAS", operand_name, np.prod(operand.shape) * operand.dtype.bits()) 
+    
     def update_relocation_offset(self, offset_type: str, offset_id: Union[int, str], size: int, **kwargs: Any) -> None:
         aligned_size: int = self.get_aligned_sized(size, as_bytes=False)
 
         if offset_type == "ACTIVATION":
-            assert "is_first_half_of_activation_buffer" in kwargs
-            is_first_half_of_activation_buffer: bool = kwargs["is_first_half_of_activation_buffer"]
-            if is_first_half_of_activation_buffer:
-                current_offset: int = self._get_current_aligned_offset_for_activation_buffer()
-            else:
-                current_offset: int = self.maximum_activation_buffer_size // 2 + self._get_current_aligned_offset_for_activation_buffer()
+            assert "offset" in kwargs
+            offset: int = kwargs["offset"]
         else:
-            current_offset: int = self.relocatables[offset_type].total_length()
+            offset: int = self.relocatables[offset_type].total_length()
 
         relocatable: Relocation = self.relocatables[offset_type]
         if offset_id not in self.relocatables[offset_type].bases:
-            relocatable.bases[offset_id] = Fragment(offset_id, size, current_offset, current_offset + aligned_size)
-            if offset_type == "ACTIVATION":
-                self._increment_current_aligned_offset_for_activation_buffer(aligned_size) 
+            relocatable.bases[offset_id] = Fragment(offset_id, size, offset, offset + aligned_size)
+    
+    def finalize_memory(self) -> None:
+        instruction_memory_size: int = self.relocatables["INSTR_MEM"].total_length()
+        weight_and_bias_memory_start: int = self.get_aligned_sized(instruction_memory_size, as_bytes=False) 
+        for fragment in self.relocatables["WEIGHT_AND_BIAS"].bases.values():
+            fragment.start += weight_and_bias_memory_start
+            fragment.end += weight_and_bias_memory_start
+        weight_and_bias_memory_size: int = self.relocatables["WEIGHT_AND_BIAS"].total_length()
+        activation_memory_start: int = self.get_aligned_sized(weight_and_bias_memory_size, as_bytes=False) 
+        for fragment in self.relocatables["ACTIVATION"].bases.values():
+            fragment.start += activation_memory_start
+            fragment.end += activation_memory_start
 
-    def _reset_current_aligned_offset_for_activation_buffer(self) -> None:
-        self._current_aligned_offset_for_activation_buffer = 0
-    
-    def _get_current_aligned_offset_for_activation_buffer(self) -> int:
-        return self._current_aligned_offset_for_activation_buffer
-    
-    def _increment_current_aligned_offset_for_activation_buffer(self, increment: int) -> None:
-        self._current_aligned_offset_for_activation_buffer += increment
+        # self.print_layout()
+ 

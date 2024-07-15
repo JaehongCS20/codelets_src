@@ -30,7 +30,7 @@ def load_impls_cdlts(cfg):
 
     if not cfg['USE_QUANTIZATION']:
         unquant_num = len(load_unquant_fusion_impl(cfg))
-        print(f"Number fusion layers: {unquant_num}")
+        # print(f"Number fusion layers: {unquant_num}")
         GENESYS_IMPLS = {
             **load_unquant_fusion_impl(cfg),
             **load_gradient_impls(cfg),

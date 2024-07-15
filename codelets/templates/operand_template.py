@@ -77,8 +77,9 @@ class OperandTemplate:
 
         for s in evaluated_shape_list:
             assert isinstance(s, (DummyParam, DummyOp)), f"Non dummy param shape: {type(s)}"
+            # print(s.name, s.value)
             operand.update_shape_symbols(s.name, s.value)
-
+        # print()
         if self.start_location is not None:
             operand.data_path = [evaluate_args(self.start_location, instance_args, tuple([]))]
 
@@ -99,6 +100,7 @@ class IndexOperandTemplate:
         operand = instance_args['CodeletTemplate'].get_operand(self.operand.name)
         # TODO: Need to fix initialization so that evaluated dummy args are placed here
         evaluated_offset = evaluate_args(self.offset.offsets, instance_args, tuple([]))
+        # print(evaluated_offset)
         assert isinstance(evaluated_offset, tuple)
         operand_idx = operand[evaluated_offset]
         return operand_idx

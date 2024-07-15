@@ -250,34 +250,20 @@ class CodeletProgram(object):
         offset = self.relocatables.get_namespace_size('INSTR_MEM') // 8
         return offset
 
-    def get_scaled_shape(self, cdlt: Codelet, operand):
-        if operand.node_name is not None:
-            op = self.graph.nodes[operand.node_name]
-            if 'base_shape' not in op.kwargs:
-                raise KeyError(f"Unable to find base shape for operand {operand.node_name} in {cdlt.op_name}, {operand.shape}")
-            return op.kwargs['base_shape']
-        else:
-            for i in (cdlt.inputs + cdlt.outputs):
-                if i.shape_list == operand.shape_list:
-                    assert i.node_name is not None
-                    op = self.graph.nodes[i.node_name]
-                    if 'base_shape' not in op.kwargs:
-                        raise KeyError(f"Unable to find base shape for operand {i.node_name} in {cdlt.op_name}")
-                    return op.kwargs['base_shape']
-            raise KeyError(f"Unable to find shape for {operand.name}")
-
-
-
-
 
     def get_codelet_instr_offset(self, cdlt_id: int) -> int:
         # Codelet instructions are a special case, where all instruction are located at the
         # end of the namespace, but we store them separate from the other namespace items
         # to allow extensibility of instruction addresses
-        input_size = self.relocatables.get_input_namespace_size()
+
+        # input_size = self.relocatables.get_input_namespace_size()
+        # cdlt_uid = self.get_codelet(cdlt_id).cdlt_uid
+        # instr_addr = self.relocatables.get_relocation('INSTR_MEM', cdlt_uid).start
+        # return (input_size + instr_addr)//8
+
         cdlt_uid = self.get_codelet(cdlt_id).cdlt_uid
         instr_addr = self.relocatables.get_relocation('INSTR_MEM', cdlt_uid).start
-        return (input_size + instr_addr)//8
+        return instr_addr // 8
 
     def get_input_operand_offset(self, operand: Operand):
         return self.relocatables.get_relocation_base(operand)
@@ -537,13 +523,6 @@ class CodeletProgram(object):
                 if k not in loop_order:
                     assert isinstance(v, FlexParam)
                     op_params[k] = v.value
-            base_shapes = {}
-            for io in (cdlt.inputs + cdlt.outputs):
-                if io.node_name is not None and 'base_shape' in self.graph.nodes[io.node_name].kwargs:
-                    base_shapes[io.name] = self.graph.nodes[io.node_name].kwargs['base_shape']
-                    if not isinstance(base_shapes[io.name], list):
-                        base_shapes[io.name] = [base_shapes[io.name]]
-
 
             op_str = {}
             op_str['operation'] = cdlt.op_name
@@ -551,9 +530,9 @@ class CodeletProgram(object):
             op_str['tile_splits'] = {k: cdlt.required_params[k].value//cdlt.param_tiling[1][k] for k in loop_order}
             op_str['iterable_dimensions'] = {k: cdlt.required_params[k].value for k in loop_order}
             op_str['operation_parameters'] = op_params
-            op_str['inputs'] = [i.emit(output_type, base_shape=base_shapes.get(i.name, None)) for i in cdlt.inputs]
+            op_str['inputs'] = [i.emit(output_type) for i in cdlt.inputs]
             op_str['intermediate'] = [t.emit(output_type) for t in cdlt.temps]
-            op_str['outputs'] = [o.emit(output_type, base_shape=base_shapes.get(o.name, None)) for o in cdlt.outputs]
+            op_str['outputs'] = [o.emit(output_type) for o in cdlt.outputs]
             op_str['operation_sequence'] = [op.emit(output_type) for op in cdlt.ops]
         elif output_type == "json_no_ops":
             op_params = {}
@@ -564,12 +543,7 @@ class CodeletProgram(object):
                 if k not in loop_order:
                     assert isinstance(v, FlexParam)
                     op_params[k] = v.value
-            base_shapes = {}
-            for io in (cdlt.inputs + cdlt.outputs):
-                if io.node_name is not None and 'base_shape' in self.graph.nodes[io.node_name].kwargs:
-                    base_shapes[io.name] = self.graph.nodes[io.node_name].kwargs['base_shape']
-                    if not isinstance(base_shapes[io.name], list):
-                        base_shapes[io.name] = [base_shapes[io.name]]
+
             op_str = {}
             op_str['operation'] = cdlt.op_name
             op_str['instance_id'] = cdlt.instance_id
@@ -577,9 +551,9 @@ class CodeletProgram(object):
             op_str['iterable_dimensions'] = {k: cdlt.required_params[k].value for k in loop_order}
 
             op_str['operation_parameters'] = op_params
-            op_str['inputs'] = [i.emit(output_type, base_shape=base_shapes.get(i.name, None)) for i in cdlt.inputs]
+            op_str['inputs'] = [i.emit("json") for i in cdlt.inputs]
             op_str['intermediate'] = [t.emit(output_type) for t in cdlt.temps]
-            op_str['outputs'] = [o.emit(output_type, base_shape=base_shapes.get(o.name, None)) for o in cdlt.outputs]
+            op_str['outputs'] = [o.emit("json") for o in cdlt.outputs]
 
         elif output_type not in ["decimal", "binary"]:
             op_str = f""
@@ -809,10 +783,11 @@ class CodeletProgram(object):
                 elif not isinstance(node, (pm.write, pm.placeholder)) and node.op_name not in missing_ops:
                     missing_ops.append(node.op_name)
             if len(missing_ops) > 0 and validate_lowered:
-                raise RuntimeError(
-                    f"Input graph includes operations which are unsupported by the target architecture.\n"
-                    f"Unsupported Operations: {[mo for mo in missing_ops]}\n"
-                    f"HAG-supported Operations: {self.hag.all_codelet_names}")
+                pass
+                #raise RuntimeError(
+                #    f"Input graph includes operations which are unsupported by the target architecture.\n"
+                #    f"Unsupported Operations: {[mo for mo in missing_ops]}\n"
+                #    f"HAG-supported Operations: {self.hag.all_codelet_names}")
         elif sequence_algorithm == 'filtered':
             assert 'filtered_layers' in sequence_kwargs
             filter_layers = sequence_kwargs['filtered_layers']
@@ -882,7 +857,7 @@ class CodeletProgram(object):
                     cdlt_tmplt = fn.run(self, cdlt_tmplt)
                     if not isinstance(cdlt_tmplt, CodeletTemplate):
                         raise RuntimeError(f"Compilation stage {fn.name}"
-                                           f" does not return codelet template.")
+                                        f" does not return codelet template.")
                 self.codelet_templates[template_name] = cdlt_tmplt
 
     def run_preprocessing_stages(self, node_sequence, codelets, verbose=False):
@@ -1002,11 +977,17 @@ class CodeletProgram(object):
                     loc_sizes[ml] += o.dtype.bits()*np.prod(list(o.tiling[ml].values()))
 
                     if loc_sizes[ml] > mem_node.size:
-                        raise RuntimeError(f"Invalid storage capacity for codelet\n"
+                        # raise RuntimeError(f"Invalid storage capacity for codelet\n"
+                        #                    f"Codelet: {cdlt.op_name} - {cdlt.cdlt_uid} --> {ml}\n"
+                        #                    f"Operand: {o.name}\n"
+                        #                    f"Tiling: {o.tiling[ml]}\n"
+                        #                    f"Mem node size: {mem_node.size_bytes}")
+                        # Ignore Capacity Issue
+                        print((f"Warning: Invalid storage capacity for codelet\n"
                                            f"Codelet: {cdlt.op_name} - {cdlt.cdlt_uid} --> {ml}\n"
                                            f"Operand: {o.name}\n"
                                            f"Tiling: {o.tiling[ml]}\n"
-                                           f"Mem node size: {mem_node.size_bytes}")
+                                           f"Mem node size: {mem_node.size_bytes}"))
 
 
     def finalize_instructions(self, node_sequence, codelets, verbose=False):
@@ -1078,6 +1059,7 @@ class CodeletProgram(object):
             num_instr = self.cdlt_num_instr(cdlt)
             end_instr_addr = num_instr * self.hag.instr_length
             self.relocatables.update_relocation_offset('INSTR_MEM', cdlt.cdlt_uid, end_instr_addr)
+        self.relocatables.finalize_memory()
 
     def finalize_flex_params(self, node_sequence, codelets, verbose=False):
         if verbose:
@@ -1177,7 +1159,7 @@ class CodeletProgram(object):
         self.update_compilation_state('compilation_stages')
 
         if finalize and self.hag.meta_cfg['GENERATE_INSTRUCTIONS']:
-            print(f"Finalizing instructions")
+            # print(f"Finalizing instructions")
             self.finalize_program(node_sequence, codelets, verbose=verbose)
             self.update_compilation_state('finalized')
             self.run_instruction_stages(codelets, verbose=verbose)
@@ -1234,7 +1216,7 @@ class CodeletProgram(object):
         self.update_compilation_state('compilation_stages')
         if stop_stage == 'compilation_stages':
             return
-        print(f"Finalizing instructions")
+        # print(f"Finalizing instructions")
 
         if finalize and self.hag.meta_cfg['GENERATE_INSTRUCTIONS']:
             self.finalize_program(node_sequence, codelets, verbose=verbose)

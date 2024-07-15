@@ -263,14 +263,14 @@ def elem_gather(hag: ArchitectureNode):
     # # TODO: Add option to create operand
     # THIS ASSUMES THE AXIS IS THE OUTERMOST AXIS. IN THE FUTURE, NEED TO ADAPT TO DIFFERENT AXES
     with CodeletTemplate("elem_gather") as cdlt:
-        N = cdlt.dummy_op("N", cdlt.node.inputs[0].shape[0])
-        C = cdlt.dummy_op("C", cdlt.node.inputs[0].shape[1])
-        H = cdlt.dummy_op("H", cdlt.node.inputs[0].shape[2])
+        N = cdlt.dummy_op("N", cdlt.node.outputs[0].shape[0])
+        C = cdlt.dummy_op("C", cdlt.node.outputs[0].shape[1])
+        H = cdlt.dummy_op("H", cdlt.node.outputs[0].shape[2])
         ONE = cdlt.dummy_op("ONE", 1)
 
-        data = cdlt.create_operand_template("data", OP_DTYPES, [N, C, H], default_dtype=acc_dtype)
+        data = cdlt.create_operand_template("data", OP_DTYPES, [N, C], default_dtype=acc_dtype)
         indices = cdlt.dummy_op("indices", cdlt.node.indices, dtype=acc_dtype_name)
-        out = cdlt.create_operand_template("out", OP_DTYPES, [N, H], default_dtype=acc_dtype)
+        out = cdlt.create_operand_template("out", OP_DTYPES, [N, C, H], default_dtype=acc_dtype)
 
         cdlt.set_inputs([data])
         cdlt.set_outputs([out])
@@ -282,11 +282,11 @@ def elem_gather(hag: ArchitectureNode):
         cdlt.configure("start", "SIMD")
 
         with cdlt.loop(H) as h:
-            with cdlt.loop(ONE) as o:
+            with cdlt.loop(C) as c:
                 with cdlt.loop(N) as n:
                     cdlt.transfer(data, ["DRAM", "VMEM1"])
                     out.set_write_destination("VMEM2")
-                    cdlt.compute("MOVE", [data[n, o, h]], [out[n, h]], target="SIMD")
+                    cdlt.compute("MOVE", [data[n, c]], [out[n, c, h]], target="SIMD")
                     cdlt.transfer(out, ["VMEM2", "DRAM"])
         cdlt.configure("end", "SIMD")
 

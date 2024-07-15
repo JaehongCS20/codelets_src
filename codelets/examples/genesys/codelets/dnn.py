@@ -18,7 +18,7 @@ def depthwise_conv(hag: ArchitectureNode):
     acc_dtype = DTYPE_MAP[acc_dtype_name]
     with CodeletTemplate("depthwise_conv") as cdlt:
         N = cdlt.dummy_op("N", cdlt.node.inputs[0].shape[0])
-        C = cdlt.dummy_op("C", cdlt.node.output[0].shape[1])
+        C = cdlt.dummy_op("C", cdlt.node.inputs[0].shape[1])
         ONE = cdlt.dummy_op("ONE", cdlt.node.inputs[1].shape[1])
         KH = cdlt.dummy_op("KH", cdlt.node.inputs[1].shape[2])
         KW = cdlt.dummy_op("KW", cdlt.node.inputs[1].shape[3])
@@ -36,8 +36,8 @@ def depthwise_conv(hag: ArchitectureNode):
 
         stride = cdlt.dummy_op("stride", cdlt.node.stride)
         pad = cdlt.dummy_op("pad", cdlt.node.pad_int)
-        zero_op = cdlt.dummy_op('zero', 0)
-        zero = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name="zero")
+        zero_op = cdlt.dummy_op('init', 0)
+        zero = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name="init")
 
         # OS ->
         cdlt.configure("start", "SIMD")
@@ -59,8 +59,7 @@ def depthwise_conv(hag: ArchitectureNode):
         cdlt.configure("end", "SIMD")
 
     cdlt = add_simd_constraint(hag, cdlt, "C")
-    if hag.meta_cfg.get("GPU_SCALING", None) is None:
-        cdlt = add_simd_tile_constraint(hag, cdlt, ["KH", "KW"])
+    cdlt = add_simd_tile_constraint(hag, cdlt, ["KH", "KW"])
 
     return cdlt
 
@@ -95,8 +94,8 @@ def depthwise_conv_bias(hag: ArchitectureNode):
         stride = cdlt.dummy_op("stride", cdlt.node.stride)
         pad = cdlt.dummy_op("pad", cdlt.node.pad_int)
         SIMD_SIZE = cdlt.dummy_op("SIMD_SIZE", cdlt.hag.all_subgraph_nodes['SIMD'].dimensions[0])
-        zero_op = cdlt.dummy_op('zero', 0)
-        zero = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name="zero")
+        zero_op = cdlt.dummy_op('init', 0)
+        zero = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name="init")
 
 
         # OS ->
@@ -201,9 +200,7 @@ def bias_add(hag: ArchitectureNode):
         cdlt.configure("end", "SIMD")
 
     cdlt = add_simd_constraint(hag, cdlt, "C")
-    if hag.meta_cfg.get("GPU_SCALING", None) is None:
-        cdlt.update_compilation_param("LEVEL1_hint", "splits['W'] == 1 and splits['H'] == 1")
-
+    cdlt.update_compilation_param("LEVEL1_hint", "splits['W'] == 1 and splits['H'] == 1")
 
     return cdlt
 
@@ -323,9 +320,9 @@ def maxpool2d(hag: ArchitectureNode):
         cdlt.set_inputs([data])
         cdlt.set_outputs([out])
         min_val, _ = range_from_cfg(FXP_CONFIGS[acc_dtype_name])
-        min_val_op = cdlt.dummy_op('zero', min_val)
+        min_val_op = cdlt.dummy_op('init', min_val)
         SIMD_SIZE = cdlt.dummy_op("SIMD_SIZE", cdlt.hag.all_subgraph_nodes['SIMD'].dimensions[0])
-        min_val_temp = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name="zero")
+        min_val_temp = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name="init")
 
         cdlt.configure("start", "SIMD")
         cdlt.configure("start", "IMM", immediate_value=min_val_op)
@@ -369,8 +366,8 @@ def averagepool2d(hag: ArchitectureNode):
         cdlt.set_outputs([out])
         denom = cdlt.dummy_op("denom", 1./(cdlt.node.kernel_size[0]*cdlt.node.kernel_size[1]), dtype=acc_dtype_name)
         denom_op = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name='denom')
-        zero_op = cdlt.dummy_op('zero', 0)
-        zero = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name="zero")
+        zero_op = cdlt.dummy_op('init', 0)
+        zero = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name="init")
         cdlt.configure("start", "SIMD")
         # denom = IH*IW
         cdlt.configure("start", "IMM", immediate_value=denom)
@@ -420,8 +417,8 @@ def global_avg_pool(hag: ArchitectureNode):
 
         denom = cdlt.dummy_op("denom", 1/(cdlt.node.inputs[0].shape[2]*cdlt.node.inputs[0].shape[3]), dtype=acc_dtype_name)
         SIMD_SIZE = cdlt.dummy_op("SIMD_SIZE", cdlt.hag.all_subgraph_nodes['SIMD'].dimensions[0])
-        zero_op = cdlt.dummy_op('zero', 0)
-        zero = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name='zero')
+        zero_op = cdlt.dummy_op('init', 0)
+        zero = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name='init')
         denom_op = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name='denom')
 
         cdlt.configure("start", "SIMD")
@@ -582,7 +579,7 @@ def softmax4d(hag):
         cdlt.configure("start", "IMM", immediate_value=mval_op)
 
         # Max reduce output
-        mx = cdlt.create_operand_template("mx", OP_DTYPES, [N, C, W], default_dtype=acc_dtype)
+        mx = cdlt.create_operand_template("mx", OP_DTYPES, [N, C, H], default_dtype=acc_dtype)
         cdlt.add_temp_operand(mx)
 
         # Expontential temporaries
@@ -609,9 +606,9 @@ def softmax4d(hag):
                         out.set_write_destination("VMEM1")
 
                         # First, compute the max value by setting memory to the minimum possible value and subtracting
-                        cdlt.compute("MOVE", [min_op], [mx[n, c, w]], target="SIMD")
-                        cdlt.compute("MAX", [data[n, c, h, w], mx[n, c, w]], [mx[n, c, w]], target="SIMD")
-                        cdlt.compute("SUB", [data[n, c, h, w], mx[n, c, w]], [out[n, c, h, w]], target="SIMD")
+                        cdlt.compute("MOVE", [min_op], [mx[n, c, h]], target="SIMD")
+                        cdlt.compute("MAX", [data[n, c, h, w], mx[n, c, h]], [mx[n, c, h]], target="SIMD")
+                        cdlt.compute("SUB", [data[n, c, h, w], mx[n, c, h]], [out[n, c, h, w]], target="SIMD")
 
                         # Now, Comptue exp
                         if hag.meta_cfg['TPU_TEST']:
@@ -630,17 +627,16 @@ def softmax4d(hag):
 
                         #
                         # # Next, compute sum for denominator
-                        cdlt.compute("MOVE", [one], [mx[n, c, w]], target="SIMD")
-                        cdlt.compute("MACC", [out[n, c, h, w], one, mx[n, c, w]], [mx[n, c, w]], target="SIMD")
+                        cdlt.compute("MOVE", [one], [mx[n, c, h]], target="SIMD")
+                        cdlt.compute("MACC", [out[n, c, h, w], one, mx[n, c, h]], [mx[n, c, h]], target="SIMD")
                         # #
                         # # # Finally, divide the exponent by the denom
-                        cdlt.compute("DIV", [out[n, c, h, w], mx[n, c, w]], [out[n, c, h, w]], target="SIMD")
+                        cdlt.compute("DIV", [out[n, c, h, w], mx[n, c, h]], [out[n, c, h, w]], target="SIMD")
                         cdlt.transfer(out, ["VMEM1", "DRAM"])
 
         cdlt.configure('end', 'SIMD')
-    if hag.meta_cfg.get("GPU_SCALING", None) is None:
-        cdlt = add_simd_constraint(hag, cdlt, "W")
-        cdlt = add_simd_tile_constraint(hag, cdlt, ["H"])
+    # cdlt = add_simd_constraint(hag, cdlt, "W")
+    # cdlt = add_simd_tile_constraint(hag, cdlt, ["H"])
     return cdlt
 
 def gelu(hag):

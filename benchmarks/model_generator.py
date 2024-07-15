@@ -9,7 +9,7 @@ import io
 from pathlib import Path
 from onnxsim import simplify
 from collections import namedtuple
-from torchvision.ops._register_onnx_ops import _onnx_opset_version
+from torchvision.ops._register_onnx_ops import BASE_ONNX_OPSET_VERSION as _onnx_opset_version
 from torchvision.models.detection.image_list import ImageList
 from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
 import sys
@@ -21,6 +21,9 @@ import numpy as np
 import csv
 
 import onnxruntime as ort
+
+import os
+from .model import model_export
 
 CWD = Path(f"{__file__}").parent
 
@@ -93,7 +96,7 @@ LAYER_UTILS = {
                                                  torch.randn(params['N'], params['C'], params['H'], params['W'])), {}),
                    "input_gen_params": ["N", "C", "H", "W"],
                    "fn_params": []},
-    "elem_exp": {"fn": lambda params: torch.exp, "input_gen": lambda params: (torch.randn(params['N'], params['C'], params['H'], params['W']), {}), "input_gen_params": ["N", "C", "H", "W"], "fn_params": []},
+    "elem_exp": {"fn": lambda params: torch.exp, "input_gen": lambda params: (torch.randn(params['N'], params['C']), {}), "input_gen_params": ["N", "C"], "fn_params": []},
     "reduce_sum": {"fn": lambda params: torch.sum, "input_gen": lambda params: (torch.randn(params['N'], params['C']), {}), "input_gen_params": ["N", "C"], "fn_params": []},
     "relu": {"fn": lambda params: torch.nn.ReLU(), "input_gen": lambda params: (torch.randn(params['N'], params['C'], params['H'], params['W']), {}), "input_gen_params": ["N", "C", "H", "W"], "fn_params": []},
     "leaky_relu": {"fn": lambda params: torch.nn.LeakyReLU(), "input_gen": lambda params: (torch.randn(params['N'], params['C'], params['H'], params['W']), {}), "input_gen_params": ["N", "C", "H", "W"], "fn_params": []},
@@ -1176,6 +1179,8 @@ def optimize_onnx(load_path, store_path, inpt_shapes, out_shapes, to_polymath, s
     model = onnx.load(load_path)
 
     unset_params = collect_unset_dims(model)
+    # print(unset_params)
+    # print(single_params.keys())
 
     if len(unset_params) > 0 and inpt_shapes is None and out_shapes is None:
         assert single_params is not None and set(single_params.keys()) == set(unset_params)
@@ -1199,15 +1204,20 @@ def optimize_onnx(load_path, store_path, inpt_shapes, out_shapes, to_polymath, s
                                                          out_shapes)
 
 
-    model = onnx.shape_inference.infer_shapes(model)
-
-    model, check = simplify(model)
+    # if 'gpt2' in load_path or 'ln' in load_path or 'attn' in load_path or 'proj' in load_path:
+    #     model = onnx.shape_inference.infer_shapes(model)
+    #     if 'ln' not in load_path:
+    #         model, check = simplify(model)
+    # else:
+    onnx.shape_inference.infer_shapes_path(load_path, store_path)
+    simplify(store_path) # -> Out Of Memory if we use full model
 
     # assert check
     # model = update_node_names(model)
     # model = update_edge_names(model)
-    with open(store_path, "wb") as f:
-        f.write(model.SerializeToString())
+    # if 'gpt2' in load_path or 'ln' in load_path or 'attn' in load_path or 'proj' in load_path:
+    #     with open(store_path, "wb") as f:
+    #         f.write(model.SerializeToString())
 
     if to_polymath:
         graph = pm.from_onnx(store_path)
@@ -1640,10 +1650,12 @@ def optimize_graph(model_name, single_params=None):
     load_path = f"{MODEL_DIR}/{model_name}.onnx"
     store_path = f"{MODEL_DIR}/{model_name}-opt.onnx"
     optimize_onnx(load_path, store_path, None, None, False, single_params=single_params)
-    model = onnx.load(store_path)
-    model = version_converter.convert_version(model,_onnx_opset_version)
-    with open(store_path, "wb") as f:
-        f.write(model.SerializeToString())
+
+    # if 'gpt2' in model_name or 'ln' in model_name or 'attn' in model_name or 'proj' in model_name:
+    #     model = onnx.load(store_path)
+    #     model = version_converter.convert_version(model,_onnx_opset_version)
+    #     with open(store_path, "wb") as f:
+    #         f.write(model.SerializeToString())
     return f"{model_name}-opt"
 
 def is_dw_conv(node, layer_info):
@@ -1832,9 +1844,150 @@ def extract_layer(model_name, layer_name):
     extracted = e.extract_model(inputs, outputs)
     onnx.save(extracted, store_path)
 
+def model_generator(model_name, batch, seq, init_or_gen, half=False, gen_ORCA=None, init_ORCA=None):
+    batch_size = batch
+    seq_length = seq
+    params = {}
+    config = {}
+
+    if model_name == 'gpt2':
+        config['vocab_size'] = 50257
+        config['n_embd'] = 768
+        config['n_head'] = 12
+
+    elif model_name == 'gpt3-125m':
+        config['vocab_size'] = 50257
+        config['n_embd'] = 768
+        config['n_head'] = 12
+    elif model_name == 'gpt3-350m':
+        config['vocab_size'] = 50257
+        config['n_embd'] = 1024
+        config['n_head'] = 16
+    elif model_name == 'gpt3-760m':
+        config['vocab_size'] = 50257
+        config['n_embd'] = 1536
+        config['n_head'] = 16
+    elif model_name == 'gpt3-1.3b':
+        config['vocab_size'] = 50257
+        config['n_embd'] = 2048
+        config['n_head'] = 24
+    elif model_name == 'gpt3-2.7b':
+        config['vocab_size'] = 50257
+        config['n_embd'] = 2560
+        config['n_head'] = 32
+    elif model_name == 'gpt3-6.7b':
+        config['vocab_size'] = 50257
+        config['n_embd'] = 4096
+        config['n_head'] = 32
+    elif model_name == 'gpt3-13b':
+        config['vocab_size'] = 50257
+        config['n_embd'] = 5120
+        config['n_head'] = 40
+    elif model_name == 'gpt3-175b':
+        config['vocab_size'] = 50257
+        config['n_embd'] = 12288
+        config['n_head'] = 96
+
+    elif model_name == 'opt-125m':
+        config['vocab_size'] = 50272
+        config['n_embd'] = 768
+        config['n_head'] = 12
+    elif model_name == 'opt-350m':
+        config['vocab_size'] = 50272
+        config['n_embd'] = 1024
+        config['n_head'] = 16
+    elif model_name == 'opt-1.3b':
+        config['vocab_size'] = 50272
+        config['n_embd'] = 2048
+        config['n_head'] = 32
+    elif model_name == 'opt-2.7b':
+        config['vocab_size'] = 50272
+        config['n_embd'] = 2560
+        config['n_head'] = 32
+    elif model_name == 'opt-6.7b':
+        config['vocab_size'] = 50272
+        config['n_embd'] = 4096
+        config['n_head'] = 32
+    elif model_name == 'opt-13b':
+        config['vocab_size'] = 50272
+        config['n_embd'] = 5120
+        config['n_head'] = 40
+    elif model_name == 'opt-30b':
+        config['vocab_size'] = 50272
+        config['n_embd'] = 7168
+        config['n_head'] = 56
+    elif model_name == 'opt-66b':
+        config['vocab_size'] = 50272
+        config['n_embd'] = 9216
+        config['n_head'] = 72
+    elif model_name == 'opt-175b':
+        config['vocab_size'] = 50272
+        config['n_embd'] = 12288
+        config['n_head'] = 96
+
+    elif model_name == 'llama-7b':
+        config['vocab_size'] = 32000
+        config['n_embd'] = 4096
+        config['n_head'] = 32
+    elif model_name == 'llama-13b':
+        config['vocab_size'] = 32000
+        config['n_embd'] = 5120
+        config['n_head'] = 40
+    elif model_name == 'llama-30b':
+        config['vocab_size'] = 32000
+        config['n_embd'] = 6656
+        config['n_head'] = 52
+    elif model_name == 'llama-70b':
+        config['vocab_size'] = 32000
+        config['n_embd'] = 8192
+        config['n_head'] = 64
+
+    else:
+        print(f"Not Implemneted Model: {sys.argv[0]}")
+
+    # initation phase
+    if init_or_gen == 'init':
+        if gen_ORCA == None and init_ORCA == None:
+            if 'llama' in model_name:
+                models = ['-embd', '-rms', '-rattn', '-proj', '-linswi']
+            else:
+                models = ['-embd', '-ln', '-attn', '-proj', '-linear1', '-linear2']
+        else:
+            if 'llama' in model_name:
+                models = ['-embd', '-rms', '-qkv', '-proj', '-linswi']
+            else:
+                models = ['-embd', '-ln', '-qkv', '-proj', '-linear1', '-linear2']
+    # generation phase
+    else:
+        if gen_ORCA == None and init_ORCA == None:
+            if 'llama' in model_name:
+                models = ['-rgen']
+            else:
+                models = ['-gen']
+        else:
+            models = []
+            if gen_ORCA != None:
+                for i in gen_ORCA:
+                    if 'llama' in model_name:
+                        models.append(f'-rgen-{i}')
+                    else:
+                        models.append(f'-gen-{i}')
+            if init_ORCA != None:
+                for i in init_ORCA:
+                    if 'llama' in model_name:
+                        models.append(f'-rinit-{i}')
+                    else:
+                        models.append(f'-init-{i}')
+
+    model_export(model_name, config, batch_size, seq_length, init_or_gen, half, gen_ORCA, init_ORCA)
+
+    for model in models:
+        model = model_name + model
+        optimize_graph(model, params)
+        os.remove(f'{os.getcwd()}/models/{model}.onnx')
 
 if __name__ == "__main__":
-    if sys.stdin and sys.stdin.isatty():
+    if False and sys.stdin and sys.stdin.isatty():
 
 
         argparser = argparse.ArgumentParser(description='ONNX Benchmark Generator')
@@ -1892,85 +2045,11 @@ if __name__ == "__main__":
             raise RuntimeError(f"Invalid benchmark supplied. Options are one of:\n"
                                f"\"lenet\", \"resnet18\".")
     else:
-        # create_vgg16(True, False, False, False)
-        # MODEL_DIR = Path(f"{Path(__file__).parent}/models")
-        # load_path = f"{MODEL_DIR}/efficientnet-lite4-new-opt.onnx"
-        # optimize_bert_onnx(False)
-        # model = onnx.load(load_path)
-        # print(dir(model))
-        # print(model.producer_version)
-        # remove_softmax_efficientnet()
-        # extract_bert_layer()
-        #
-        # sequences = [['Conv', 'Relu'],
-        #              ['Conv', 'Relu', 'MaxPool'],
-        #              ['Conv', 'Add', 'Relu', 'GlobalAveragePool'],
-        #              ['Conv', 'Add', 'Relu']]
-        # # sequences = [['Conv', 'Relu', 'MaxPool'], ]
-        # # sequences = [['Conv', 'Add'],
-        # #              ['Conv', 'Clip', 'AveragePool'],
-        # #              ['Conv', 'Clip', 'DepthwiseConv',],
-        # #              ['Conv', 'Clip', 'DepthwiseConv', 'Clip',], ]
-        # optimize_graph('efficientnet-lite4-new')
-        # create_mobilenet(True, False, False, False,
-        #                  batch_size=1)
-        # optimize_graph('mobilenetv2-12', single_params={'batch_size': 1})
-        # quantize_model('bertsquad-12-opt-trimmed')
-        # optimize_bert_onnx(False)
-        # set_bert_shapes()
-        # name = "bertsquad-12-opt-trimmed"
-        # # name = "bertsquad-12-opt-trimmed-fuse-tester"
-        # sequences = [
-        #                 ["MatMul", "Reshape", "Add", "Add",
-        #                  "ReduceMean",
-        #                  "Sub",
-        #                  "Mul",
-        #                  "ReduceMean",
-        #                  "Add",
-        #                  "Sqrt",
-        #                  "Reciprocal",
-        #                  "Mul", ["Mul", "Mul"], "Sub", "Add"],
-        #              ["Gemm", "Add", "ReduceMean", "Sub", "Mul", "ReduceMean",
-        #                                                    "Add", "Sqrt", "Reciprocal", "Mul", ["Mul", "Mul"],
-        #                                                    "Sub", "Add"],
-        #              ["MatMul", "Mul", "Add", "Softmax"],
-        #              ["Gemm", "Reshape", "Transpose"], ["MatMul", "Transpose"],
-        #              ["Gemm","Pow","Mul","Add", "Mul", "Tanh", "Add", "Mul", "Mul",]
-        # ]
-        # seq = [
-        #         ["Gemm",
-        #          "Add",
-        #          "ReduceMean",
-        #          "Sub",
-        #          "Mul",
-        #          "ReduceMean",
-        #          "Add",
-        #          "Sqrt",
-        #          "Reciprocal",
-        #          "Mul",
-        #          ["Mul", "Mul",],
-        #           "Sub",
-        #          "Add"]
-        # ]
-        # optimize_graph('ddpg_model')
-        # extract_layer("bert-base-cased-transpose-opt-trimmed-ort", "Transpose_1111")
-        params = {"N": 1, "H": 1, "W": 128, "C": 128}
-        create_custom_layer("elem_div", params, True, True, False, False, fname="div_test")
-        # create_vgg16(False, False, False, False)
-        # create_vgg16(args.optimize_model,
-        #              args.training_mode,
-        #              args.data_format_convert,
-        #              args.to_polymath,
-        #                 batch_size=args.batch_size)        # optimize_graph(model)
-        # extract_lenet()
-        # name = "mobilenetv2-opt"
-        # sequences = [['Conv', 'Add'],
-        #              # ['Conv', 'Clip', 'AveragePool'],
-        #              ['Conv', 'Clip', 'DepthwiseConv',],
-        #              ['Conv', 'Clip', 'DepthwiseConv', 'Clip',], ]
-        # fusion_generator(name, sequences, test_run=True)
-        # create_custom_fft(True, False, False, (1, 2048))
-        # trim_gpt2()
-        # model = "gpt2-opt"
-        # create_custom_gemm(True, False, False, False, 8, 128, 128)
-#
+        # if len(sys.argv) < 5:
+            # print(f"Usage: {sys.argv[0]} model_name batch_size seq_len init_or_gen")
+            # exit(0)
+        
+        # gpt_generator(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
+        optimize_graph('llama-7b-rinit-256', {})
+        optimize_graph('llama-7b-gen-256', {})
+        optimize_graph('llama-7b-rgen-256', {})

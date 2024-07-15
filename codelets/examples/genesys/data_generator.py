@@ -69,8 +69,8 @@ class DataGen(object):
                 os.makedirs(self.output_dir)
             except OSError as e:
                 print(f"Creation of directory {self.output_dir} failed:\n {e}")
-            else:
-                print(f"Successfully created of directory {self.output_dir}")
+            # else:
+            #     print(f"Successfully created of directory {self.output_dir}")
 
     @property
     def single_codelets(self):
@@ -540,8 +540,8 @@ class DataGen(object):
         if 'arch_cfg' in self.output_types:
             assert self.arch_cfg is not None
             self.arch_cfg['IBUF_END'] = int(BENCH_BASE_ADDR['IBUF'] + np.prod(self.program.codelets[0].inputs[0].shape))
-            repo = git.Repo(search_parent_directories=True)
-            self.arch_cfg['COMPILER_COMMIT_HASH'] = repo.head.object.hexsha
+            #repo = git.Repo(search_parent_directories=True)
+            #self.arch_cfg['COMPILER_COMMIT_HASH'] = repo.head.object.hexsha
             res = json.dumps(self.arch_cfg, indent=2)
             with open(f"{self.output_dir}/{self.program.name}_arch_cfg.json", "w") as outfile:
                 outfile.write(res)

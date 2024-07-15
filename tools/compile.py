@@ -8,12 +8,12 @@ from functools import partial
 from pprint import pprint
 
 import polymath as pm
-from codelets.examples import GENESYS_DTYPES, USE_QUANTIZATION, \
+from codelets.examples.genesys import USE_QUANTIZATION, \
     SW_PIPELINE_TEST, ADDR_GEN_TEST, PAPER_CFG2, PAPER_CFG1, CUSTOM_CFG
 
-from codelets.examples import FUSION_OP_INFO
-from codelets.examples import compile_full_model
-from codelets.examples import DataGen
+from codelets.examples.genesys import FUSION_OP_INFO
+from codelets.examples.genesys import compile_full_model
+from codelets.examples.genesys import DataGen
 from tools.compile_layer import store_program_codelets
 
 import onnxruntime as ort

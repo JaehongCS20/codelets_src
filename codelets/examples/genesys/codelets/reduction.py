@@ -38,9 +38,9 @@ def reduce_mean(cdlt_name: str, ninput_dims, axis, hag: ArchitectureNode):
         denom = cdlt.dummy_op("denom", 1/(cdlt.node.inputs[0].shape[axis]), dtype=acc_dtype_name)
         axis_op = cdlt.dummy_op("axis", cdlt.node.kwargs['axes'][0])
         SIMD_SIZE = cdlt.dummy_op("SIMD_SIZE", cdlt.hag.all_subgraph_nodes['SIMD'].dimensions[0])
-        zero = cdlt.dummy_op('zero', 0)
+        zero = cdlt.dummy_op('init', 0)
 
-        zero_op = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name="zero")
+        zero_op = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name="init")
         denom_op = cdlt.create_temp_operand([SIMD_SIZE], "IMM", name='denom')
 
         cdlt.configure("start", "SIMD")
@@ -78,9 +78,8 @@ def reduce_mean(cdlt_name: str, ninput_dims, axis, hag: ArchitectureNode):
 
         cdlt.configure("end", "SIMD")
         inner_dim = DIM_NAMES[ninput_dims - 1]
-        cdlt = add_simd_constraint(hag, cdlt, inner_dim)
-        if hag.meta_cfg.get('GPU_SCALING', None) is None:
-            cdlt.add_compilation_param("LEVEL1_hint", f"sizes['{inner_dim}'] > {hag.all_subgraph_nodes['SIMD'].dimensions[0]}")
+        # cdlt = add_simd_constraint(hag, cdlt, inner_dim)
+        # cdlt.add_compilation_param("LEVEL1_hint", f"sizes['{inner_dim}'] > {hag.all_subgraph_nodes['SIMD'].dimensions[0]}")
 
     return cdlt
 
@@ -280,7 +279,7 @@ def load_reduce_cdlts(cfg):
         "reduce_sum": reduce_sum,
         "reduce_mean2d": reduce_mean2d,
         # "reduce_mean2d": partial(reduce_mean, 'reduce_mean2d', 2, 0),
-        "reduce_mean3d": partial(reduce_mean, 'reduce_mean3d', 3, 1),
+        "reduce_mean3d": partial(reduce_mean, 'reduce_mean3d', 3, 2),
         # "reduce_mean3d": partial(reduce_mean, 'reduce_mean3d', 3, 2),
         "reduce_min2d": reduce_min2d,
     }

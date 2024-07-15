@@ -141,8 +141,7 @@ def get_tile_info(cdlt, hag, factor_fn_name) -> TilingInfo:
         for i, access in enumerate(o.data_moves):
             if access.src_node != access.dst_node:
                 level_accesses[cdlt.get_tile_level(access.dst_node)].append(access)
-
-        loop_dependencies += [dp for dp in list(set(o.dependencies)) if dp not in loop_dependencies and "loop" in dp]
+        loop_dependencies += [dp for dp in sorted(list(set(o.dependencies))) if dp not in loop_dependencies and "loop" in dp]
 
     op_params = {}
     loop_order = [v for v in cdlt.loop_param_map.values()]

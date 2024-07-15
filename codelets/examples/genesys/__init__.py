@@ -47,36 +47,36 @@ BYTE = 8
 # GENESYS_CFG['INSTR_WIDTH'] = 32
 #
 #
-# PAPER_CFG1 = False
-# NON_ASIC_32CFG = False
-# TINY_CFG = False
-# SMALL_CFG = False
-# MED_CFG = False
-# ASIC_CONFIG = False
-# PAPER_CFG2 = False
-# CUSTOM_CFG = 32
-# DEMO_CFG = False
-#
-# ## Quantization
-# USE_QUANTIZATION = False
-#
-#
-# SW_PIPELINE_TEST = False
-# ADDR_GEN_TEST = False
-#
-#
-# SYS_TILE_CONSTR = False
-# FUSION_CONSTRAINTS = False
-# ALL_QUANT_OFF = True
-#
-# if SW_PIPELINE_TEST:
-#     USE_QUANTIZATION = False
-#     ALL_QUANT_OFF = True
-#     FUSION_CONSTRAINTS = False
-#
-# if ALL_QUANT_OFF:
-#     USE_QUANTIZATION = False
-#
+PAPER_CFG1 = False
+NON_ASIC_32CFG = False
+TINY_CFG = False
+SMALL_CFG = False
+MED_CFG = False
+ASIC_CONFIG = False
+PAPER_CFG2 = False
+CUSTOM_CFG = 32
+DEMO_CFG = False
+
+## Quantization
+USE_QUANTIZATION = False
+
+
+SW_PIPELINE_TEST = False
+ADDR_GEN_TEST = False
+
+
+SYS_TILE_CONSTR = False
+FUSION_CONSTRAINTS = False
+ALL_QUANT_OFF = True
+
+if SW_PIPELINE_TEST:
+    USE_QUANTIZATION = False
+    ALL_QUANT_OFF = True
+    FUSION_CONSTRAINTS = False
+
+if ALL_QUANT_OFF:
+    USE_QUANTIZATION = False
+
 
 
 ### End quantization
