@@ -43,6 +43,7 @@ def compile_model(model_name, batch, seq, init_or_gen, arch_config, half=False, 
             store_path = os.path.join(cwd, f"tools/compilation_output/{model}_{arch}_b{batch}_s{seq}_{init_or_gen}/{model}.onnx")
             shutil.move(model_path, store_path)
 
+            # move external model files for extreme cases such as 175b or 30b with large seq length
             if '175b' in model_name:
                 if 'embd-opt' in model:
                     model_path = os.path.join(cwd, f"benchmarks/models/wte.weight")
@@ -65,7 +66,14 @@ def compile_model(model_name, batch, seq, init_or_gen, arch_config, half=False, 
                     model_path = os.path.join(cwd, f"benchmarks/models/c_proj.weight")
                     store_path = os.path.join(cwd, f"tools/compilation_output/{model}_{arch}_b{batch}_s{seq}_{init_or_gen}/c_proj.weight")
                     shutil.move(model_path, store_path)
-
+            elif '30b' in model_name and int(seq) >= 16384: # external embd layer happens when seq length is large
+                if 'embd-opt' in model:
+                    model_path = os.path.join(cwd, f"benchmarks/models/wte.weight")
+                    store_path = os.path.join(cwd, f"tools/compilation_output/{model}_{arch}_b{batch}_s{seq}_{init_or_gen}/wte.weight")
+                    shutil.move(model_path, store_path)
+                    model_path = os.path.join(cwd, f"benchmarks/models/_Constant_attr__value")
+                    store_path = os.path.join(cwd, f"tools/compilation_output/{model}_{arch}_b{batch}_s{seq}_{init_or_gen}/_Constant_attr__value")
+                    shutil.move(model_path, store_path)
             # move to copiled_result folder
             if parent != None:
                 result_folder= os.path.join(cwd, f"tools/compilation_output/{model}_{arch}_b{batch}_s{seq}_{init_or_gen}")

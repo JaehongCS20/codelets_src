@@ -133,9 +133,9 @@ class RoPE_Attn(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1))  / (math.sqrt(self.n_embd // self.n_head)) # Remove elem_div_const
+        att = (q @ k.transpose(-2, -1))  / (math.sqrt(self.n_embd // self.n_head))
         # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1) # Remove Softmax
+        att = F.softmax(att, dim=-1)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(self.batch * self.seq, self.n_embd) # re-assemble all head outputs side by side
 
@@ -166,9 +166,9 @@ class Attn_Orca(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         att = q @ k.transpose(-2, -1)
-        att = att / (self.n_embd // self.n_head) # Remove elem_div_const
+        att = att / (self.n_embd // self.n_head)
         # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1) # Remove Softmax
+        att = F.softmax(att, dim=-1)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(self.batch * self.seq, self.n_embd) # re-assemble all head outputs side by side
 
@@ -192,9 +192,9 @@ class RoPE_Attn_Orca(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         att = q @ k.transpose(-2, -1)
-        att = att / (self.n_embd // self.n_head) # Remove elem_div_const
+        att = att / (self.n_embd // self.n_head)
         # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1) # Remove Softmax
+        att = F.softmax(att, dim=-1)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(self.batch * self.seq, self.n_embd) # re-assemble all head outputs side by side
 

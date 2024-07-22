@@ -1883,6 +1883,10 @@ def model_generator(model_name, batch, seq, init_or_gen, half=False, gen_ORCA=No
         config['vocab_size'] = 50257
         config['n_embd'] = 5120
         config['n_head'] = 40
+    elif model_name == 'gpt3-30b':
+        config['vocab_size'] = 50257
+        config['n_embd'] = 7168
+        config['n_head'] = 56
     elif model_name == 'gpt3-175b':
         config['vocab_size'] = 50257
         config['n_embd'] = 12288
