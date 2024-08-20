@@ -201,6 +201,32 @@ class RoPE_Attn_Orca(nn.Module):
         return y
 
 class Gen(torch.nn.Module):
+    def __init__(self, n_head, n_embd, batch, cache_len):
+        super().__init__()
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.batch = batch
+        self.seq = 1
+        self.cache_len = cache_len
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x, cache_K, cache_V):
+        
+        # QKV generation
+        q, k ,v  = self.c_attn(x).view(self.batch, self.seq, -1).split(self.n_embd, dim=2)
+        q = q.view(self.batch , self.seq, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
+        k = k.view(self.batch, self.seq, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
+        v = v.view(self.batch, self.seq, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
+
+        k = torch.cat((k.transpose(-2,-1), cache_K), dim=3)
+        v = torch.cat((v, cache_V), dim=2)
+        att = torch.matmul(q, k)
+        att = torch.div(att, (self.n_embd // self.n_head))
+        att = F.softmax(att, dim=-1)
+        res = torch.matmul(att, v).transpose(1, 2)
+        return res, k, v
+
+class Gen_Orca(torch.nn.Module):
     def __init__(self, n_head, n_embd, cache_len):
         super().__init__()
         self.cache_len = cache_len
@@ -220,6 +246,35 @@ class Gen(torch.nn.Module):
         return res, k, v
 
 class RoPE_Gen(torch.nn.Module):
+    def __init__(self, n_head, n_embd, batch, cache_len):
+        super().__init__()
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.cache_len = cache_len
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.batch = batch
+        self.seq = 1
+        self.freqs_cis = precompute_freqs_cis(n_embd // n_head, 2048 * 2)[0:self.seq]
+
+    def forward(self, x, cache_K, cache_V):
+
+        # QKV generation
+        q, k ,v  = self.c_attn(x).view(self.batch, self.seq, -1).split(self.n_embd, dim=2)
+        q = q.view(self.batch , self.seq, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
+        k = k.view(self.batch, self.seq, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
+        v = v.view(self.batch, self.seq, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
+
+        q, k = apply_rotary_emb(q, k, self.freqs_cis, self.n_head, self.n_embd, self.seq)
+
+        k = torch.cat((k.transpose(-2,-1), cache_K), dim=3)
+        v = torch.cat((v, cache_V), dim=2)
+        att = torch.matmul(q, k)
+        att = torch.div(att, (self.n_embd // self.n_head))
+        att = F.softmax(att, dim=-1)
+        res = torch.matmul(att, v).transpose(1, 2)
+        return res, k, v
+
+class RoPE_Gen_Orca(torch.nn.Module):
     def __init__(self, n_head, n_embd, cache_len):
         super().__init__()
         self.cache_len = cache_len
@@ -457,34 +512,30 @@ def model_export(model_name, config, batch, seq, init_or_gen, half=False, gen_OR
         if gen_ORCA == None and init_ORCA == None:
             if 'llama' in model_name:
                 layer = f'{model_name}-rgen'
-                input_ids_1 = torch.rand(batch_size, 1, n_head, n_embd // n_head)
-                input_ids_2 = torch.rand(batch_size, 1, n_head, n_embd // n_head)
-                input_ids_3 = torch.rand(batch_size, 1, n_head, n_embd // n_head)
-                input_ids_4 = torch.rand(batch_size, n_head, n_embd // n_head, seq_len)
-                input_ids_5 = torch.rand(batch_size, n_head, seq_len, n_embd // n_head)
-                model = RoPE_Gen(n_head, n_embd, seq_len).cpu().eval()
+                input_ids_1 = torch.rand(batch_size * 1, n_embd).cpu()
+                input_ids_2 = torch.rand(batch_size, n_head, n_embd // n_head, seq_len)
+                input_ids_3 = torch.rand(batch_size, n_head, seq_len, n_embd // n_head)
+                model = RoPE_Gen(n_head, n_embd, batch, seq_len).cpu().eval()
                 with torch.no_grad():
-                    output_1 = model(input_ids_1, input_ids_2, input_ids_3, input_ids_4, input_ids_5)
+                    output_1 = model(input_ids_1, input_ids_2, input_ids_3)
 
                 # print(f"Saving {layer}")
-                save_model(layer, model, (input_ids_1, input_ids_2, input_ids_3, input_ids_4, input_ids_5), output_1, half=half,
+                save_model(layer, model, (input_ids_1, input_ids_2, input_ids_3), output_1, half=half,
                                                 opset_version=11,      
-                                                input_names=['input1', 'input2', 'input3', 'input4', 'input5'])
+                                                input_names=['input1', 'input2', 'input3'])
             else:
                 layer = f'{model_name}-gen'
-                input_ids_1 = torch.rand(batch_size, 1, n_head, n_embd // n_head)
-                input_ids_2 = torch.rand(batch_size, 1, n_head, n_embd // n_head)
-                input_ids_3 = torch.rand(batch_size, 1, n_head, n_embd // n_head)
-                input_ids_4 = torch.rand(batch_size, n_head, n_embd // n_head, seq_len)
-                input_ids_5 = torch.rand(batch_size, n_head, seq_len, n_embd // n_head)
-                model = Gen(n_head, n_embd, seq_len).cpu().eval()
+                input_ids_1 = torch.rand(batch_size * 1, n_embd).cpu()
+                input_ids_2 = torch.rand(batch_size, n_head, n_embd // n_head, seq_len)
+                input_ids_3 = torch.rand(batch_size, n_head, seq_len, n_embd // n_head)
+                model = Gen(n_head, n_embd, batch, seq_len).cpu().eval()
                 with torch.no_grad():
-                    output_1 = model(input_ids_1, input_ids_2, input_ids_3, input_ids_4, input_ids_5)
+                    output_1 = model(input_ids_1, input_ids_2, input_ids_3)
 
                 # print(f"Saving {layer}")
-                save_model(layer, model, (input_ids_1, input_ids_2, input_ids_3, input_ids_4, input_ids_5), output_1, half=half,
+                save_model(layer, model, (input_ids_1, input_ids_2, input_ids_3), output_1, half=half,
                                                 opset_version=11,      
-                                                input_names=['input1', 'input2', 'input3', 'input4', 'input5'])
+                                                input_names=['input1', 'input2', 'input3'])
         else:
             
             if init_ORCA != None:
@@ -525,7 +576,7 @@ def model_export(model_name, config, batch, seq, init_or_gen, half=False, gen_OR
                         input_ids_3 = torch.rand(batch_size, 1, n_head, n_embd // n_head)
                         input_ids_4 = torch.rand(batch_size, n_head, n_embd // n_head, i)
                         input_ids_5 = torch.rand(batch_size, n_head, i, n_embd // n_head)
-                        model = RoPE_Gen(n_head, n_embd, i).cpu().eval()
+                        model = RoPE_Gen_Orca(n_head, n_embd, i).cpu().eval()
                         with torch.no_grad():
                             output_1 = model(input_ids_1, input_ids_2, input_ids_3, input_ids_4, input_ids_5)
 
@@ -541,7 +592,7 @@ def model_export(model_name, config, batch, seq, init_or_gen, half=False, gen_OR
                         input_ids_3 = torch.rand(batch_size, 1, n_head, n_embd // n_head)
                         input_ids_4 = torch.rand(batch_size, n_head, n_embd // n_head, i)
                         input_ids_5 = torch.rand(batch_size, n_head, i, n_embd // n_head)
-                        model = Gen(n_head, n_embd, i).cpu().eval()
+                        model = Gen_Orca(n_head, n_embd, i).cpu().eval()
                         with torch.no_grad():
                             output_1 = model(input_ids_1, input_ids_2, input_ids_3, input_ids_4, input_ids_5)
 
